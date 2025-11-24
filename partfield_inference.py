@@ -9,6 +9,13 @@ import os, sys
 import numpy as np
 import random
 
+# Register safe globals for PyTorch 2.6+ weights_only loading
+try:
+    import yacs.config
+    torch.serialization.add_safe_globals([yacs.config.CfgNode])
+except ImportError:
+    pass
+
 def predict(cfg):
     seed_everything(cfg.seed)
 

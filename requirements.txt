@@ -1,0 +1,43 @@
+# requirements.txt generated from provided pip commands
+# NOTE: This file includes some platform-specific wheel references.
+# System packages (install with apt):
+#   sudo apt install libx11-6 libgl1 libxrender1
+
+# PyTorch CUDA wheels are provided from the PyTorch CUDA index. Use it as
+# an extra index so pip still queries PyPI for regular packages (e.g. lightning).
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# PyTorch + CUDA builds
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+torchaudio==2.7.0+cu128
+
+# Other Python packages
+psutil==7.1.3
+lightning==2.2
+h5py
+yacs
+trimesh
+scikit-image
+loguru
+boto3
+mesh2sdf
+tetgen
+pymeshlab
+plyfile
+einops
+libigl
+polyscope
+potpourri3d
+simple_parsing
+arrgh
+open3d
+vtk
+gradio
+
+# torch-scatter needs prebuilt wheels from the PyG index matching your
+# PyTorch/CUDA build. Install using the PyG find-links page for torch 2.7.0+cu128:
+-f https://data.pyg.org/whl/torch-2.7.0+cu128.html
+torch-scatter
+
+# End of requirements.txt
