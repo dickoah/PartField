@@ -6,7 +6,7 @@ triplane_channels_low: 128
 triplane_channels_high: 512
 triplane_resolution: 128
 
-n_point_per_face: 1000
+n_point_per_face: 500
 n_sample_each: 10000
 is_pc : False
 remesh_demo : False

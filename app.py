@@ -615,13 +615,13 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
                     "Naive (simple chaining)",
                     "MST-based (better for fragmented)",
                 ])],
-                value=1,
+                value=0,
                 label="Adjacency Matrix Option",
                 info="How to handle disconnected mesh components"
             )
             with_knn = gr.Checkbox(
                 label="Use KNN edges", 
-                value=True,
+                value=False,
                 info="Helps with messy mesh connectivity"
             )
             is_pc = gr.Checkbox(label="Input is Point Cloud (.ply)", value=False,
@@ -656,7 +656,7 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
         outputs=[output_model, parts_slider]
     )
 
-    # When slider changes, show the selected part
+    # When slider changes, show the saelected part
     def slider_to_model(slider_val, file_list):
         if not isinstance(file_list, (list, tuple)) or not file_list:
             return None
