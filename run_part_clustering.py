@@ -2,14 +2,9 @@ from sklearn.cluster import AgglomerativeClustering, KMeans
 import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
-import numpy as np
 import os
 import argparse
-import time
 
-import json
-from os.path import join
-from typing import List
 
 from collections import defaultdict
 from scipy.sparse import coo_matrix, csr_matrix
@@ -636,7 +631,7 @@ def load_ply_to_numpy(filename):
     
     return points
 
-def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_render_fol= "test_render_clustering", use_agglo=False, max_num_clusters=18, is_pc=False, option=1, with_knn=True, export_mesh=True):
+def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_render_fol= "test_render_clustering", use_agglo=False, max_num_clusters=18, is_pc=False, option=1, with_knn=True, export_mesh=True, single_output=False):
     print(uid, view_id)
     
     if not is_pc:
@@ -662,7 +657,9 @@ def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_re
     point_feat = point_feat / np.linalg.norm(point_feat, axis=-1, keepdims=True)
 
     if not use_agglo:
-        for num_cluster in range(2, max_num_clusters):
+        # If single_output mode, only process max_num_clusters; otherwise iterate from 2 to max
+        cluster_range = [max_num_clusters] if single_output else range(2, max_num_clusters + 1)
+        for num_cluster in cluster_range:
             clustering = KMeans(n_clusters=num_cluster, random_state=0).fit(point_feat)
             labels = clustering.labels_
 
@@ -702,36 +699,55 @@ def solve_clustering(input_fname, uid, view_id, save_dir="test_results1", out_re
         else:
             adj_matrix = construct_face_adjacency_matrix_ccmst(mesh.faces, mesh.vertices, with_knn=with_knn)
 
-        clustering = AgglomerativeClustering(connectivity=adj_matrix,
-                                    n_clusters=1,
-                                    ).fit(point_feat)
-        hierarchical_labels = hierarchical_clustering_labels(clustering.children_, point_feat.shape[0], max_cluster=max_num_clusters)
-
-        all_FL = []
-        for n_cluster in range(max_num_clusters):
-            print("Processing cluster: "+str(n_cluster))
-            labels = hierarchical_labels[n_cluster]
-            all_FL.append(labels)
-        
-        
-        all_FL = np.array(all_FL)
-        unique_labels = np.unique(all_FL)
-
-        for n_cluster in range(max_num_clusters):
-            FL = all_FL[n_cluster]
-            relabel = np.zeros((len(FL), 1))
-            for i, label in enumerate(unique_labels):
-                relabel[FL == label] = i  # Assign RGB values to each label
-
+        if single_output:
+            # Direct clustering to exactly max_num_clusters - no intermediate results
+            clustering = AgglomerativeClustering(
+                connectivity=adj_matrix,
+                n_clusters=max_num_clusters,
+            ).fit(point_feat)
+            
+            FL = clustering.labels_
             V = mesh.vertices
             F = mesh.faces
 
-            if export_mesh :
-                fname_mesh = os.path.join(out_render_fol, "ply", str(uid) + "_" + str(view_id) + "_" + str(max_num_clusters - n_cluster).zfill(2) + ".ply")
+            if export_mesh:
+                fname_mesh = os.path.join(out_render_fol, "ply", str(uid) + "_" + str(view_id) + "_" + str(max_num_clusters).zfill(2) + ".ply")
                 export_colored_mesh_ply(V, F, FL, filename=fname_mesh)
 
-            fname_clustering = os.path.join(out_render_fol, "cluster_out", str(uid) + "_" + str(view_id) + "_" + str(max_num_clusters - n_cluster).zfill(2))
+            fname_clustering = os.path.join(out_render_fol, "cluster_out", str(uid) + "_" + str(view_id) + "_" + str(max_num_clusters).zfill(2))
             np.save(fname_clustering, FL)
+        else:
+            # Hierarchical mode: compute all intermediate segmentations from 1 to max_num_clusters
+            clustering = AgglomerativeClustering(connectivity=adj_matrix,
+                                        n_clusters=1,
+                                        ).fit(point_feat)
+            hierarchical_labels = hierarchical_clustering_labels(clustering.children_, point_feat.shape[0], max_cluster=max_num_clusters)
+
+            all_FL = []
+            for n_cluster in range(max_num_clusters):
+                print("Processing cluster: "+str(n_cluster))
+                labels = hierarchical_labels[n_cluster]
+                all_FL.append(labels)
+            
+            
+            all_FL = np.array(all_FL)
+            unique_labels = np.unique(all_FL)
+
+            for n_cluster in range(max_num_clusters):
+                FL = all_FL[n_cluster]
+                relabel = np.zeros((len(FL), 1))
+                for i, label in enumerate(unique_labels):
+                    relabel[FL == label] = i  # Assign RGB values to each label
+
+                V = mesh.vertices
+                F = mesh.faces
+
+                if export_mesh :
+                    fname_mesh = os.path.join(out_render_fol, "ply", str(uid) + "_" + str(view_id) + "_" + str(max_num_clusters - n_cluster).zfill(2) + ".ply")
+                    export_colored_mesh_ply(V, F, FL, filename=fname_mesh)
+
+                fname_clustering = os.path.join(out_render_fol, "cluster_out", str(uid) + "_" + str(view_id) + "_" + str(max_num_clusters - n_cluster).zfill(2))
+                np.save(fname_clustering, FL)
         
         
             

@@ -5,7 +5,6 @@ import tempfile
 import atexit
 import time
 import trimesh
-from pathlib import Path
 import subprocess
 import logging
 import math
@@ -89,27 +88,6 @@ def clear_gpu_memory():
     logger.info("Cleared CUDA cached memory")
 
 
-def load_model(file):
-    """Load a model file and copy it to data directory in a subfolder named after the model (without extension)"""
-    if file is None or not hasattr(file, "name"):
-        return None, "Please upload a valid model file."
-
-    src_path = getattr(file, "name", "")
-    if not src_path or not os.path.isfile(src_path):
-        return None, f"Invalid file path: {src_path}"
-
-    original_filename = os.path.basename(src_path)
-    model_name = Path(original_filename).stem
-    
-    dest_dir = os.path.join(SCRIPT_DIR, "data", model_name)
-    os.makedirs(dest_dir, exist_ok=True)
-    
-    dest_path = os.path.join(dest_dir, original_filename)
-    shutil.copy2(src_path, dest_path)
-    
-    return model_name, f"Model '{original_filename}' loaded successfully!\nSaved to: {dest_path}"
-
-
 def convert_ply_to_glb(ply_path, glb_dir):
     """Convert a PLY file to GLB format with caching"""
     os.makedirs(glb_dir, exist_ok=True)
@@ -127,28 +105,6 @@ def convert_ply_to_glb(ply_path, glb_dir):
     mesh = trimesh.load(ply_path, process=False)
     mesh.export(glb_path)
     return glb_path
-
-
-def convert_all_ply_to_glb(model_name):
-    """Convert all PLY files to GLB and return list of GLB files"""
-    if not model_name:
-        return []
-    
-    ply_dir = os.path.join(SCRIPT_DIR, "exp_results", "clustering", model_name, "ply")
-    glb_dir = os.path.join(SCRIPT_DIR, "exp_results", "clustering", model_name, "glb")
-    
-    if not os.path.isdir(ply_dir):
-        return []
-
-    filenames = [f for f in sorted(os.listdir(ply_dir)) if f.endswith(".ply")]
-    return [
-        (os.path.basename(glb_path), glb_path)
-        for filename in filenames
-        for ply_path in [os.path.abspath(os.path.join(ply_dir, filename))]
-        if os.path.isfile(ply_path)
-        for glb_path in [convert_ply_to_glb(ply_path, glb_dir)]
-        if glb_path
-    ]
 
 
 def upload_partfield_model():
@@ -204,51 +160,6 @@ def upload_partfield_model():
     else:
         logger.warning("Cloned repo but no .ckpt files found in %s", model_dir)
         return False
-
-
-def combine_glbs_into_cumulative(glb_paths, out_dir, n):
-    """
-    Create n GLB files where file k contains the union of the first k parts.
-
-    glb_paths: list of absolute file paths for individual part GLBs (ordered)
-    out_dir: directory to write cumulative GLBs
-    n: number of cumulative files to create (<= len(glb_paths))
-    Returns list of generated file paths.
-    """
-    if not glb_paths:
-        logger.warning("No GLB paths provided for cumulative export")
-        return []
-
-    os.makedirs(out_dir, exist_ok=True)
-    generated = []
-    total = min(max(n, 0), len(glb_paths))
-    if total == 0:
-        return []
-
-    # Pre-load meshes to avoid repeated disk reads
-    def _to_scene(path: str) -> trimesh.Scene:
-        obj = trimesh.load(path, force='scene')
-        return trimesh.Scene(obj) if isinstance(obj, trimesh.Trimesh) else obj
-
-    loaded = [_to_scene(p) for p in glb_paths]
-
-    for k in range(1, total + 1):
-        scene = trimesh.Scene()
-        for i in range(k):
-            s = loaded[i]
-            if s is None:
-                continue
-            # Add each geometry from the scene
-            for name, geom in s.geometry.items():
-                # Ensure unique names
-                scene.add_geometry(geom.copy(), node_name=f"part_{i}_{name}")
-
-        out_path = os.path.join(out_dir, f"parts_1_to_{k}.glb")
-        # Export scene as glb
-        scene.export(out_path)
-        generated.append(out_path)
-
-    return generated
 
 
 def _get_mesh_path(mesh_file_path) -> str:
@@ -395,7 +306,8 @@ def run_segmentation_and_prepare(
     use_agglo: bool = True,
     clustering_option: int = 0,
     with_knn: bool = False,
-    is_pc: bool = False
+    is_pc: bool = False,
+    single_output: bool = False
 ) -> tuple[str, str | None, list[str]]:
     """
     Run the full segmentation pipeline: inference + clustering + conversion.
@@ -408,10 +320,11 @@ def run_segmentation_and_prepare(
         clustering_option: 0=naive, 1=MST-based adjacency
         with_knn: Add KNN edges (for messy meshes)
         is_pc: Input is point cloud (PLY)
+        single_output: Only generate one output with exactly N parts (faster)
     """
     logger.info("=== Starting segmentation pipeline ===")
-    logger.info("Mesh file: %s, Parts: %d, Agglo: %s, Option: %d, KNN: %s", 
-                mesh_file_path, n_parts, use_agglo, clustering_option, with_knn)
+    logger.info("Mesh file: %s, Parts: %d, Agglo: %s, Option: %d, KNN: %s, Single: %s", 
+                mesh_file_path, n_parts, use_agglo, clustering_option, with_knn, single_output)
     log_gpu_memory()
 
     if n_parts < 1:
@@ -564,7 +477,8 @@ def run_segmentation_and_prepare(
                     is_pc=is_pc,
                     option=clustering_option,
                     with_knn=with_knn,
-                    export_mesh=True
+                    export_mesh=True,
+                    single_output=single_output
                 )
                 
             clear_gpu_memory()
@@ -588,7 +502,10 @@ def run_segmentation_and_prepare(
         logger.info("Temp directory: %s", temp_result_dir)
 
         if glb_files:
-            msg = f"✓ Segmentation complete! {n_parts} part(s) segmented.\nSelect part from slider to view and download."
+            if single_output:
+                msg = f"✓ Segmentation complete! Single output with {n_parts} part(s)."
+            else:
+                msg = f"✓ Segmentation complete! Generated {len(glb_files)} segmentation(s).\nSelect from slider to view different part counts."
             first_model = glb_files[0] if glb_files else None
             return msg, first_model, glb_files
         else:
@@ -626,6 +543,11 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
             )
             is_pc = gr.Checkbox(label="Input is Point Cloud (.ply)", value=False,
                                 info="Check if input is point cloud instead of mesh")
+            single_output = gr.Checkbox(
+                label="Single output mode", 
+                value=True,
+                info="Only generate one segmentation with exactly N parts (faster). Uncheck to get all segmentations from 2 to N parts."
+            )
             
             generate_btn = gr.Button("Generate", variant="primary")
             status_box = gr.Textbox(label="Status / Output", lines=10, interactive=False)
@@ -638,7 +560,7 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
     # Wire events
     generate_btn.click(
         fn=run_segmentation_and_prepare,
-        inputs=[input_model, num_parts, use_agglo, clustering_option, with_knn, is_pc],
+        inputs=[input_model, num_parts, use_agglo, clustering_option, with_knn, is_pc, single_output],
         outputs=[status_box, output_model, files_state],
     )
 
