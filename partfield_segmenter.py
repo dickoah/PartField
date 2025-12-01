@@ -53,7 +53,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 # Import inference and clustering functions
-from run_part_clustering import solve_clustering
+from partfield_clusterer import PartFieldClusterer
 from partfield.config.defaults import _C as base_cfg
 from partfield.model_trainer_pvcnn_only_demo import Model
 
@@ -263,14 +263,17 @@ class PartFieldSegmenter:
             clustering_output_dir = os.path.join(temp_result_dir, "clustering")
             os.makedirs(clustering_output_dir, exist_ok=True)
             
-            # Create subdirectories that solve_clustering expects
-            os.makedirs(os.path.join(clustering_output_dir, "ply"), exist_ok=True)
-            os.makedirs(os.path.join(clustering_output_dir, "cluster_out"), exist_ok=True)
+            # Create ply subdirectory for PartFieldClusterer output
+            ply_dir = os.path.join(clustering_output_dir, "ply")
+            os.makedirs(ply_dir, exist_ok=True)
 
             # Run clustering directly
             logger.info("Running clustering directly")
             
             try:
+                # Initialize clusterer
+                clusterer = PartFieldClusterer()
+                
                 # Get list of input files to process
                 if preprocess_model and enable_preprocessing:
                      # If using preprocessed model, look for the file we just generated
@@ -286,26 +289,33 @@ class PartFieldSegmenter:
                     raise FileNotFoundError("No compatible input files found for clustering")
 
                 for input_file in input_files:
-                    input_fname = os.path.join(model_dir, input_file)
+                    input_path = os.path.join(model_dir, input_file)
                     uid = input_file.split('.')[0]
-                    view_id = 0
+                    
+                    # Load features for this model
+                    features_path = os.path.join(features_dir, f"part_feat_{uid}_0.npy")
+                    if not os.path.exists(features_path):
+                        features_path = os.path.join(features_dir, f"part_feat_{uid}_0_batch.npy")
+                    
+                    if not os.path.exists(features_path):
+                        logger.warning("Features not found for %s, skipping", uid)
+                        continue
                     
                     logger.info("Processing: %s (uid=%s)", input_file, uid)
                     
-                    # Call solve_clustering directly
-                    solve_clustering(
-                        input_fname=input_fname,
-                        uid=uid,
-                        view_id=view_id,
-                        save_dir=features_dir,
-                        out_render_fol=clustering_output_dir,
+                    # Call PartFieldClusterer (outputs to ply_dir)
+                    result = clusterer.process(
+                        features=features_path,
+                        mesh=input_path,
+                        n_parts=n_parts,
                         use_agglo=use_agglo,
-                        max_num_clusters=n_parts,
-                        is_pc=is_pc,
-                        option=clustering_option,
+                        clustering_option=clustering_option,
                         with_knn=with_knn,
+                        is_pc=is_pc,
+                        single_output=single_output,
                         export_mesh=True,
-                        single_output=single_output
+                        output_dir=ply_dir,
+                        verbose=True
                     )
                     
                 self._clear_gpu_memory()
@@ -317,7 +327,6 @@ class PartFieldSegmenter:
                 return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
 
             # Convert PLY to GLB (all in temp)
-            ply_dir = os.path.join(clustering_output_dir, "ply")
             if not os.path.isdir(ply_dir):
                 msg = f"PLY output directory not found: {ply_dir}"
                 logger.warning(msg)
