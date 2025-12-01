@@ -27,18 +27,31 @@ from typing import Union, Optional, List, Dict, Any
 from pathlib import Path
 
 import trimesh
-
-# Import inference and clustering functions
-from run_part_clustering import solve_clustering
-from partfield_inference import predict
-from partfield.config.defaults import _C as base_cfg
+import random
+import numpy as np
 
 # Try to import torch and GPU utilities for memory analysis
 try:
     import torch
+    from lightning.pytorch import seed_everything, Trainer
+    from lightning.pytorch.strategies import DDPStrategy
+    from lightning.pytorch.callbacks import ModelCheckpoint
+    
+    # Register safe globals for PyTorch 2.6+ weights_only loading
+    try:
+        import yacs.config
+        torch.serialization.add_safe_globals([yacs.config.CfgNode])
+    except ImportError:
+        pass
+        
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+
+# Import inference and clustering functions
+from run_part_clustering import solve_clustering
+from partfield.config.defaults import _C as base_cfg
+from partfield.model_trainer_pvcnn_only_demo import Model
 
 # Setup logging
 logger = logging.getLogger("partfield_segmenter")
@@ -65,14 +78,6 @@ class PartFieldSegmenter:
     # ======== Main methods ========
     def __init__(
         self,
-        n_parts: int = 10,
-        use_agglo: bool = True,
-        clustering_option: int = 1,
-        with_knn: bool = True,
-        is_pc: bool = False,
-        single_output: bool = True,
-        enable_preprocessing: bool = True,
-        preprocessing_threshold: float = 1e-6,
         checkpoint_path: Optional[str] = None,
         config_path: Optional[str] = None,
         script_dir: Optional[str] = None
@@ -81,32 +86,11 @@ class PartFieldSegmenter:
         Initialize the PartField segmenter.
         
         Args:
-            n_parts: Number of parts for clustering (default: 10)
-            use_agglo: Use agglomerative clustering (default: True) vs K-Means
-            clustering_option: 0=naive, 1=MST-based (default), 2=CC-MST
-            with_knn: Add KNN edges (default: True)
-            is_pc: Input is point cloud (default: False)
-            single_output: Only output final N-part segmentation (default: True)
-            enable_preprocessing: Enable mesh preprocessing (default: True)
-            preprocessing_threshold: Vertex dedup threshold (default: 1e-6)
             checkpoint_path: Path to model checkpoint (auto-detected if None)
             config_path: Path to config file (auto-detected if None)
             script_dir: Script directory (auto-detected if None)
         """
-        # Clustering parameters
-        self.n_parts = n_parts
-        self.use_agglo = use_agglo
-        self.clustering_option = clustering_option
-        self.with_knn = with_knn
-        
-        # Input/output type
-        self.is_pc = is_pc
-        self.single_output = single_output
-        
-        # Preprocessing
-        self.enable_preprocessing = enable_preprocessing
-        self.preprocessing_threshold = preprocessing_threshold
-        
+
         # Paths
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self.checkpoint_path = checkpoint_path or os.path.join(
@@ -116,38 +100,64 @@ class PartFieldSegmenter:
             self.script_dir, "configs", "final", "demo.yaml"
         )
         
+        # Sanity checks
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"Config not found: {self.config_path}")
+        
+        if not os.path.exists(self.checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
+        
         # Temp directory
         self.temp_dir = None
         
         # Validate and verify
-        self._validate_config()
         self._download_model()
         self._check_resources()
         
-        logger.info(f"[PartFieldSegmenter] Initialized: {self.n_parts} parts, "
-                    f"agglo={self.use_agglo}, single_output={self.single_output}")
+        logger.info(f"[PartFieldSegmenter] Initialized")
 
     def process(
         self,
         mesh: Union[trimesh.Trimesh, trimesh.Scene, str, Path],
-        preprocess_model: bool = False
+        n_parts: int = 10,
+        use_agglo: bool = True,
+        clustering_option: int = 1,
+        with_knn: bool = True,
+        is_pc: bool = False,
+        single_output: bool = True,
+        enable_preprocessing: bool = True,
+        preprocess_model: bool = False,
+        preprocessing_threshold: float = 1e-6,
     ) -> Dict[str, Any]:
         """
         Segment a mesh into semantic parts.
         
         Args:
             mesh: Input mesh (Trimesh, Scene, or file path)
+            n_parts: Number of parts for clustering (default: 10)
+            use_agglo: Use agglomerative clustering (default: True) vs K-Means
+            clustering_option: 0=naive, 1=MST-based (default), 2=CC-MST
+            with_knn: Add KNN edges (default: True)
+            is_pc: Input is point cloud (default: False)
+            single_output: Only output final N-part segmentation (default: True)
+            enable_preprocessing: Enable mesh preprocessing (default: True)
+            preprocess_model: Use preprocessed mesh for inference
+            preprocessing_threshold: Vertex dedup threshold (default: 1e-6)
         
         Returns:
             dict with keys:
                 - 'status': Success message
                 - 'glb_files': List of output GLB file paths
+                - 'scene': Trimesh Scene object of the result
                 - 'temp_dir': Temporary directory path (will be cleaned up on exit)
                 - 'n_parts': Number of parts generated
         """
+        if n_parts < 1:
+            raise ValueError("Number of parts must be at least 1")
+
         logger.info("=== Starting segmentation pipeline ===")
         logger.info("Parts: %d, Agglo: %s, Option: %d, KNN: %s, Single: %s", 
-                    self.n_parts, self.use_agglo, self.clustering_option, self.with_knn, self.single_output)
+                    n_parts, use_agglo, clustering_option, with_knn, single_output)
 
         # Create temp directory for this run
         self.temp_dir = tempfile.mkdtemp(prefix="partfield_seg_")
@@ -187,13 +197,13 @@ class PartFieldSegmenter:
                 raise ValueError(f"Unsupported input type: {type(mesh)}")
             
             # Preprocess the mesh
-            if self.enable_preprocessing:
+            if enable_preprocessing:
                 logger.info("=== Mesh Preprocessing ===")
                 preprocess_dir = os.path.join(temp_result_dir, "preprocessing")
                 os.makedirs(preprocess_dir, exist_ok=True)
                 try:
                     # Preprocess returns path to PLY in preprocess_dir
-                    preprocessed_mesh_path = self._preprocess_mesh(target_mesh_path, preprocess_dir, self.preprocessing_threshold)
+                    preprocessed_mesh_path = self._preprocess_mesh(target_mesh_path, preprocess_dir, preprocessing_threshold, is_pc=is_pc)
                     
                     if preprocess_model:
                         logger.info("Using preprocessed mesh for inference: %s", preprocessed_mesh_path)
@@ -215,7 +225,7 @@ class PartFieldSegmenter:
                 cfg = self._build_config(data_path=model_dir, result_name=result_name)
                 
                 # Run prediction directly
-                predict(cfg)
+                self._run_inference(cfg)
                 logger.info("Inference completed successfully")
                 self._clear_gpu_memory()
                 
@@ -223,14 +233,14 @@ class PartFieldSegmenter:
                 msg = f"Inference failed: {str(e)}"
                 logger.error(msg)
                 logger.exception(e)
-                return {"status": msg, "glb_files": [], "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
 
             # Verify features were generated in exp_results
             actual_features_dir = os.path.join(self.script_dir, "exp_results", result_name)
             if not os.path.exists(actual_features_dir):
                 msg = f"Inference output not found: {actual_features_dir}"
                 logger.error(msg)
-                return {"status": msg, "glb_files": [], "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
             
             # Copy features to temp dir
             for fname in os.listdir(actual_features_dir):
@@ -258,14 +268,14 @@ class PartFieldSegmenter:
             
             try:
                 # Get list of input files to process
-                if preprocess_model and self.enable_preprocessing:
+                if preprocess_model and enable_preprocessing:
                      # If using preprocessed model, look for the file we just generated
-                     ext = ".ply" if self.is_pc else ".glb"
+                     ext = ".ply" if is_pc else ".glb"
                      input_files = [f for f in os.listdir(model_dir) if f.endswith(ext)]
                 else:
                     input_files = [
                         f for f in os.listdir(model_dir)
-                        if (f.endswith(".ply") and self.is_pc) or (f.endswith((".obj", ".glb")) and not self.is_pc)
+                        if (f.endswith(".ply") and is_pc) or (f.endswith((".obj", ".glb")) and not is_pc)
                     ]
 
                 if not input_files:
@@ -285,13 +295,13 @@ class PartFieldSegmenter:
                         view_id=view_id,
                         save_dir=features_dir,
                         out_render_fol=clustering_output_dir,
-                        use_agglo=self.use_agglo,
-                        max_num_clusters=self.n_parts,
-                        is_pc=self.is_pc,
-                        option=self.clustering_option,
-                        with_knn=self.with_knn,
+                        use_agglo=use_agglo,
+                        max_num_clusters=n_parts,
+                        is_pc=is_pc,
+                        option=clustering_option,
+                        with_knn=with_knn,
                         export_mesh=True,
-                        single_output=self.single_output
+                        single_output=single_output
                     )
                     
                 self._clear_gpu_memory()
@@ -300,14 +310,14 @@ class PartFieldSegmenter:
                 msg = f"Clustering failed: {str(e)}"
                 logger.error(msg)
                 logger.exception(e)
-                return {"status": msg, "glb_files": [], "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
 
             # Convert PLY to GLB (all in temp)
             ply_dir = os.path.join(clustering_output_dir, "ply")
             if not os.path.isdir(ply_dir):
                 msg = f"PLY output directory not found: {ply_dir}"
                 logger.warning(msg)
-                return {"status": msg, "glb_files": [], "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
 
             glb_dir = os.path.join(clustering_output_dir, "glbs")
             glb_files = self._convert_outputs_to_glb(ply_dir, glb_dir)
@@ -324,8 +334,8 @@ class PartFieldSegmenter:
                     logger.warning("Failed to load result into Trimesh Scene: %s", e)
 
             if glb_files:
-                if self.single_output:
-                    msg = f"✓ Segmentation complete! Single output with {self.n_parts} part(s)."
+                if single_output:
+                    msg = f"✓ Segmentation complete! Single output with {n_parts} part(s)."
                 else:
                     msg = f"✓ Segmentation complete! Generated {len(glb_files)} segmentation(s)."
                 
@@ -391,6 +401,48 @@ class PartFieldSegmenter:
         # Freeze the config to prevent accidental modification
         cfg.freeze()
         return cfg
+
+    def _run_inference(self, cfg: Any) -> None:
+        """
+        Run inference using PyTorch Lightning Trainer.
+        """
+        if not TORCH_AVAILABLE:
+            raise ImportError("PyTorch and Lightning are required for inference.")
+
+        seed_everything(cfg.seed)
+
+        torch.manual_seed(0)
+        random.seed(0)
+        np.random.seed(0)
+        
+        checkpoint_callbacks = [ModelCheckpoint(
+            monitor="train/current_epoch",
+            dirpath=cfg.output_dir,
+            filename="{epoch:02d}",
+            save_top_k=100,
+            save_last=True,
+            every_n_epochs=cfg.save_every_epoch,
+            mode="max",
+            verbose=True
+        )]
+
+        trainer = Trainer(devices=1, # Use 1 GPU to avoid DDP complications in interactive mode
+                          accelerator="gpu",
+                          precision="16-mixed",
+                          strategy=DDPStrategy(find_unused_parameters=True),
+                          max_epochs=cfg.training_epochs,
+                          log_every_n_steps=1,
+                          limit_train_batches=3500,
+                          limit_val_batches=None,
+                          callbacks=checkpoint_callbacks
+                         )
+
+        model = Model(cfg)        
+
+        if cfg.remesh_demo:
+            cfg.n_point_per_face = 10
+
+        trainer.predict(model, ckpt_path=cfg.continue_ckpt)
     
     def _clear_gpu_memory(self) -> None:
         """Release cached GPU memory when possible."""
@@ -407,9 +459,7 @@ class PartFieldSegmenter:
             torch.cuda.ipc_collect()
         logger.info("Cleared CUDA cached memory")
     
-    def _validate_config(self) -> None:
-        if self.n_parts < 1:
-            raise ValueError("Number of parts must be at least 1")
+
 
     def _download_model(self) -> bool:
         """Ensure a local copy of the PartField checkpoint exists in `model/`."""
@@ -467,7 +517,7 @@ class PartFieldSegmenter:
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"Config not found: {self.config_path}")
        
-    def _preprocess_mesh(self, mesh_input: Union[trimesh.Trimesh, trimesh.Scene, str, Path], output_dir: str, threshold: float = 1e-6) -> str:
+    def _preprocess_mesh(self, mesh_input: Union[trimesh.Trimesh, trimesh.Scene, str, Path], output_dir: str, threshold: float = 1e-6, is_pc: bool = False) -> str:
         """
         Preprocess a mesh by cleaning up vertices and removing duplicates.
         """
@@ -520,7 +570,7 @@ class PartFieldSegmenter:
         # Determine output format based on is_pc
         # If is_pc is False (mesh mode), we must use .glb or .obj because Demo_Dataset 
         # ignores .ply files in mesh mode.
-        ext = ".ply" if self.is_pc else ".glb"
+        ext = ".ply" if is_pc else ".glb"
         output_path = os.path.join(output_dir, f"mesh_preprocessed{ext}")
         
         combined_mesh.export(output_path)

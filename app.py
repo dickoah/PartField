@@ -31,15 +31,15 @@ if not logger.handlers:
 # Get the directory where this script is located (should be PartField root)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Initialize segmenter globally to avoid re-checking resources on every run
+segmenter = PartFieldSegmenter(script_dir=SCRIPT_DIR)
+
 # Temporary base directory for generated runs - will be removed at process exit
 TEMP_BASE_DIR = tempfile.mkdtemp(prefix="partfield_app_")
 
-
 def _cleanup_temp():
     shutil.rmtree(TEMP_BASE_DIR)
-
 atexit.register(_cleanup_temp)
-
 
 def run_segmentation_and_prepare(
     mesh_file_path: str, 
@@ -65,19 +65,17 @@ def run_segmentation_and_prepare(
         single_output: Only generate one output with exactly N parts (faster)
         preprocess_model: Use preprocessed mesh for inference
     """
-    # Initialize segmenter
-    segmenter = PartFieldSegmenter(
+    # Run process using the global segmenter instance
+    result = segmenter.process(
+        mesh_file_path, 
         n_parts=n_parts,
         use_agglo=use_agglo,
         clustering_option=clustering_option,
         with_knn=with_knn,
         is_pc=is_pc,
         single_output=single_output,
-        script_dir=SCRIPT_DIR
+        preprocess_model=preprocess_model
     )
-    
-    # Run process
-    result = segmenter.process(mesh_file_path, preprocess_model=preprocess_model)
     
     if result['status'].startswith("Error") or not result['glb_files']:
         return result['status'], None, []
