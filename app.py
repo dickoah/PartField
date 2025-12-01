@@ -48,7 +48,8 @@ def run_segmentation_and_prepare(
     clustering_option: int = 0,
     with_knn: bool = False,
     is_pc: bool = False,
-    single_output: bool = False
+    single_output: bool = False,
+    preprocess_model: bool = False
 ) -> tuple[str, str | None, list[str]]:
     """
     Run the full segmentation pipeline: inference + clustering + conversion.
@@ -62,6 +63,7 @@ def run_segmentation_and_prepare(
         with_knn: Add KNN edges (for messy meshes)
         is_pc: Input is point cloud (PLY)
         single_output: Only generate one output with exactly N parts (faster)
+        preprocess_model: Use preprocessed mesh for inference
     """
     # Initialize segmenter
     segmenter = PartFieldSegmenter(
@@ -75,7 +77,7 @@ def run_segmentation_and_prepare(
     )
     
     # Run process
-    result = segmenter.process(mesh_file_path)
+    result = segmenter.process(mesh_file_path, preprocess_model=preprocess_model)
     
     if result['status'].startswith("Error") or not result['glb_files']:
         return result['status'], None, []
@@ -122,6 +124,11 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
             )
             is_pc = gr.Checkbox(label="Input is Point Cloud (.ply)", value=False,
                                 info="Check if input is point cloud instead of mesh")
+            preprocess_model = gr.Checkbox(
+                label="Preprocess Model", 
+                value=False,
+                info="Use preprocessed mesh for inference (may improve results for messy meshes)"
+            )
             single_output = gr.Checkbox(
                 label="Single output mode", 
                 value=True,
@@ -139,7 +146,7 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
     # Wire events
     generate_btn.click(
         fn=run_segmentation_and_prepare,
-        inputs=[input_model, num_parts, use_agglo, clustering_option, with_knn, is_pc, single_output],
+        inputs=[input_model, num_parts, use_agglo, clustering_option, with_knn, is_pc, single_output, preprocess_model],
         outputs=[status_box, output_model, files_state],
     )
 
