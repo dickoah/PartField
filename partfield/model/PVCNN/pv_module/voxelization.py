@@ -14,7 +14,7 @@ def my_voxelization(features, coords, resolution):
     indices = coords[:, 0] * r2 + coords[:, 1] * r + coords[:, 2]
     indices = indices.unsqueeze(dim=1).expand(-1, result.shape[1], -1)
     features = torch.cat([features, torch.ones(features.shape[0], 1, features.shape[2], device=features.device, dtype=features.dtype)], dim=1)
-    out_feature = result.scatter_(index=indices.long(), src=features, dim=2, reduce='add')
+    out_feature = torch.scatter_reduce(result, dim=2, index=indices.long(), src=features, reduce='sum', include_self=True)
     cnt = out_feature[:, -1:, :]
     zero_mask = (cnt == 0).float()
     cnt = cnt * (1 - zero_mask) + zero_mask * 1e-5

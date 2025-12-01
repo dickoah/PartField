@@ -37,6 +37,10 @@ try:
     from lightning.pytorch.strategies import DDPStrategy
     from lightning.pytorch.callbacks import ModelCheckpoint
     
+    # Set optimal precision for GPUs with Tensor Cores
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('medium')
+    
     # Register safe globals for PyTorch 2.6+ weights_only loading
     try:
         import yacs.config
@@ -434,7 +438,8 @@ class PartFieldSegmenter:
                           log_every_n_steps=1,
                           limit_train_batches=3500,
                           limit_val_batches=None,
-                          callbacks=checkpoint_callbacks
+                          callbacks=checkpoint_callbacks,
+                          logger=False  # Disable default logger to avoid tensorboardX requirement
                          )
 
         model = Model(cfg)        
