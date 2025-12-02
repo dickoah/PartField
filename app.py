@@ -10,7 +10,7 @@ import logging
 import math
 
 # Import the new segmenter
-from partfield_segmenter import PartFieldSegmenter
+from partfield.partfield_segmenter import PartFieldSegmenter
 
 # Setup logging (use local file location)
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")

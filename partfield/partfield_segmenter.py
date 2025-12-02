@@ -53,9 +53,9 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 # Import inference and clustering functions
-from partfield_clusterer import PartFieldClusterer
-from partfield.config.defaults import _C as base_cfg
-from partfield.model_trainer_pvcnn_only_demo import Model
+from .partfield_clusterer import PartFieldClusterer
+from .config.defaults import _C as base_cfg
+from .model_trainer_pvcnn_only_demo import Model
 
 # Setup logging
 logger = logging.getLogger("partfield_segmenter")

@@ -33,7 +33,7 @@ import trimesh
 import open3d as o3d
 import matplotlib.pyplot as plt
 
-from partfield.utils import load_mesh_util
+from .utils import load_mesh_util
 
 # Setup logging
 logger = logging.getLogger("partfield_clusterer")
