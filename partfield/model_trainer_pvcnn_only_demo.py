@@ -2,9 +2,9 @@ import torch
 import lightning.pytorch as pl
 from .dataloader import Demo_Dataset, Demo_Remesh_Dataset, Correspondence_Demo_Dataset
 from torch.utils.data import DataLoader
-from partfield.model.UNet.model import ResidualUNet3D
-from partfield.model.triplane import TriplaneTransformer, get_grid_coord #, sample_from_planes, Voxel2Triplane
-from partfield.model.model_utils import VanillaMLP
+from .model.UNet.model import ResidualUNet3D
+from .model.triplane import TriplaneTransformer, get_grid_coord #, sample_from_planes, Voxel2Triplane
+from .model.model_utils import VanillaMLP
 import torch.nn.functional as F
 import torch.nn as nn
 import os
@@ -13,7 +13,7 @@ import skimage
 import numpy as np
 import h5py
 import torch.distributed as dist
-from partfield.model.PVCNN.encoder_pc import TriPlanePC2Encoder, sample_triplane_feat
+from .model.PVCNN.encoder_pc import TriPlanePC2Encoder, sample_triplane_feat
 import json
 import gc
 import time

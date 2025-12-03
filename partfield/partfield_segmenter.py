@@ -240,9 +240,22 @@ class PartFieldSegmenter:
                 return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
 
             # Verify features were generated in exp_results
-            actual_features_dir = os.path.join(self.script_dir, "exp_results", result_name)
-            if not os.path.exists(actual_features_dir):
-                msg = f"Inference output not found: {actual_features_dir}"
+            # Model saves to "exp_results/{result_name}" relative to CWD
+            # But we also check script_dir just in case
+            
+            possible_dirs = [
+                os.path.join(os.getcwd(), "exp_results", result_name),
+                os.path.join(self.script_dir, "exp_results", result_name)
+            ]
+            
+            actual_features_dir = None
+            for d in possible_dirs:
+                if os.path.exists(d):
+                    actual_features_dir = d
+                    break
+            
+            if not actual_features_dir:
+                msg = f"Inference output not found in: {possible_dirs}"
                 logger.error(msg)
                 return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
             

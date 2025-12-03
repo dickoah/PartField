@@ -24,7 +24,7 @@ import tempfile
 ### For mesh processing
 import pymeshlab
 
-from partfield.utils import *
+from .utils import *
 
 #########################
 ## To handle quad inputs
