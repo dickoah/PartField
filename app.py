@@ -65,6 +65,16 @@ def run_segmentation_and_prepare(
         single_output: Only generate one output with exactly N parts (faster)
         preprocess_model: Use preprocessed mesh for inference
     """
+    print("==========================================================")
+    print(f"Running segmentation on {mesh_file_path} with :\n"
+          f"- n_parts={n_parts}\n"
+          f"- use_agglo={use_agglo}\n"
+          f"- clustering_option={clustering_option}\n"
+          f"- with_knn={with_knn}\n"
+          f"- is_pc={is_pc}\n"
+          f"- single_output={single_output}\n"
+          f"- preprocess_model={preprocess_model}")
+    print("==========================================================")
     # Run process using the global segmenter instance
     result = segmenter.process(
         mesh_file_path, 

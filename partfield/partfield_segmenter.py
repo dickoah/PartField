@@ -104,17 +104,10 @@ class PartFieldSegmenter:
             self.script_dir, "configs", "final", "demo.yaml"
         )
         
-        # Sanity checks
-        if not os.path.exists(self.config_path):
-            raise FileNotFoundError(f"Config not found: {self.config_path}")
-        
-        if not os.path.exists(self.checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
-        
         # Temp directory
         self.temp_dir = None
         
-        # Validate and verify
+        # Download model if needed, then validate all resources exist
         self._download_model()
         self._check_resources()
         
@@ -169,6 +162,7 @@ class PartFieldSegmenter:
         try:
             # Set up unique result directory in temp folder
             timestamp = int(time.time())
+            
             # Determine basename
             if isinstance(mesh, (str, Path)):
                 model_basename = os.path.basename(str(mesh)).split('.')[0]
@@ -193,8 +187,7 @@ class PartFieldSegmenter:
                 shutil.copy2(mesh_path, target_mesh_path)
                 logger.info("Copied input mesh to %s", target_mesh_path)
             elif isinstance(mesh, (trimesh.Trimesh, trimesh.Scene)):
-                mesh_filename = "input_mesh.glb" # Default export format
-                target_mesh_path = os.path.join(model_dir, mesh_filename)
+                target_mesh_path = os.path.join(model_dir, "input_mesh.glb" )
                 mesh.export(target_mesh_path)
                 logger.info("Exported input mesh object to %s", target_mesh_path)
             else:
@@ -489,19 +482,33 @@ class PartFieldSegmenter:
 
 
     def _download_model(self) -> bool:
-        """Ensure a local copy of the PartField checkpoint exists in `model/`."""
-        model_dir = os.path.join(self.script_dir, "model")
+        """Ensure a local copy of the PartField checkpoint exists at checkpoint_path."""
+        # First check if the configured checkpoint file already exists
+        if os.path.isfile(self.checkpoint_path):
+            logger.info("Checkpoint file already exists: %s", self.checkpoint_path)
+            return True
+        
+        model_dir = os.path.dirname(self.checkpoint_path)
         os.makedirs(model_dir, exist_ok=True)
 
-        # Look for any .ckpt files already present
-        ckpt_files = [p for p in os.listdir(model_dir) if p.endswith(".ckpt")]
+        # Look for any .ckpt files already present in the directory
+        ckpt_files = [p for p in os.listdir(model_dir) if p.endswith(".ckpt")] if os.path.isdir(model_dir) else []
         if ckpt_files:
             logger.info("Found existing checkpoint files in %s: %s", model_dir, ckpt_files)
             return True
 
-        # Clone the repo directly into model/
+        # Clone the repo directly into model_dir
         clone_url = "https://huggingface.co/mikaelaangel/partfield-ckpt"
-        logger.info("No local checkpoint found — starting git clone of %s into %s", clone_url, model_dir)
+        logger.info("Checkpoint not found at %s — starting git clone of %s", self.checkpoint_path, clone_url)
+        
+        # Remove the directory if it exists but is incomplete (to allow clean clone)
+        if os.path.isdir(model_dir) and os.listdir(model_dir):
+            logger.warning("Model directory exists but is incomplete. It will be cleaned before cloning.")
+            try:
+                shutil.rmtree(model_dir)
+            except Exception as e:
+                logger.error("Failed to remove incomplete model directory: %s", e)
+                return False
         
         cmd = ["git", "clone", clone_url, model_dir]
         logger.info("Executing command: %s", " ".join(cmd))
@@ -528,21 +535,20 @@ class PartFieldSegmenter:
             logger.error("Error during git clone: %s", e)
             return False
 
-        # Verify that .ckpt files now exist
-        ckpt_files = [p for p in os.listdir(model_dir) if p.endswith(".ckpt")]
-        if ckpt_files:
-            logger.info("Successfully downloaded checkpoint files: %s", ckpt_files)
+        # Verify that the checkpoint file now exists
+        if os.path.isfile(self.checkpoint_path):
+            logger.info("Successfully downloaded checkpoint: %s", self.checkpoint_path)
             return True
         else:
-            logger.warning("Cloned repo but no .ckpt files found in %s", model_dir)
+            logger.warning("Downloaded checkpoint directory but configured file not found: %s", self.checkpoint_path)
             return False
 
     def _check_resources(self) -> None:
-        if not os.path.exists(self.checkpoint_path):
-            # Checkpoint might not exist yet if it's being downloaded by app.py
-            pass
-        if not os.path.exists(self.config_path):
-            raise FileNotFoundError(f"Config not found: {self.config_path}")
+        """Verify that required checkpoint and config files exist."""
+        if not os.path.isfile(self.checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {self.checkpoint_path}")
+        if not os.path.isfile(self.config_path):
+            raise FileNotFoundError(f"Config file not found: {self.config_path}")
        
     def _preprocess_mesh(self, mesh_input: Union[trimesh.Trimesh, trimesh.Scene, str, Path], output_dir: str, threshold: float = 1e-6, is_pc: bool = False) -> str:
         """
