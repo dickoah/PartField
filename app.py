@@ -84,7 +84,7 @@ def run_segmentation_and_prepare(
         with_knn=with_knn,
         is_pc=is_pc,
         single_output=single_output,
-        preprocess_model=preprocess_model
+        enable_preprocessing=preprocess_model
     )
     
     if result['status'].startswith("Error") or not result['glb_files']:

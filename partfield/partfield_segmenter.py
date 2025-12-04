@@ -123,7 +123,6 @@ class PartFieldSegmenter:
         is_pc: bool = False,
         single_output: bool = True,
         enable_preprocessing: bool = True,
-        preprocess_model: bool = False,
         preprocessing_threshold: float = 1e-6,
     ) -> Dict[str, Any]:
         """
@@ -193,23 +192,17 @@ class PartFieldSegmenter:
             else:
                 raise ValueError(f"Unsupported input type: {type(mesh)}")
             
-            # Preprocess the mesh
+            # Preprocess the mesh if enabled
             if enable_preprocessing:
                 logger.info("=== Mesh Preprocessing ===")
                 preprocess_dir = os.path.join(temp_result_dir, "preprocessing")
                 os.makedirs(preprocess_dir, exist_ok=True)
                 try:
-                    # Preprocess returns path to PLY in preprocess_dir
                     preprocessed_mesh_path = self._preprocess_mesh(target_mesh_path, preprocess_dir, preprocessing_threshold, is_pc=is_pc)
-                    
-                    if preprocess_model:
-                        logger.info("Using preprocessed mesh for inference: %s", preprocessed_mesh_path)
-                        model_dir = preprocess_dir
-                    else:
-                        logger.info("Mesh preprocessing completed at %s (but using original mesh for inference to match legacy behavior)", preprocessed_mesh_path)
+                    logger.info("Using preprocessed mesh for inference: %s", preprocessed_mesh_path)
+                    model_dir = preprocess_dir
                 except Exception as e:
                     logger.warning("Mesh preprocessing failed: %s. Continuing with original mesh.", e)
-                    # Continue with original mesh if preprocessing fails
 
             # Run inference directly            
             # Create temp features dir
@@ -281,15 +274,10 @@ class PartFieldSegmenter:
                 clusterer = PartFieldClusterer()
                 
                 # Get list of input files to process
-                if preprocess_model and enable_preprocessing:
-                     # If using preprocessed model, look for the file we just generated
-                     ext = ".ply" if is_pc else ".glb"
-                     input_files = [f for f in os.listdir(model_dir) if f.endswith(ext)]
-                else:
-                    input_files = [
-                        f for f in os.listdir(model_dir)
-                        if (f.endswith(".ply") and is_pc) or (f.endswith((".obj", ".glb")) and not is_pc)
-                    ]
+                input_files = [
+                    f for f in os.listdir(model_dir)
+                    if (f.endswith(".ply") and is_pc) or (f.endswith((".obj", ".glb")) and not is_pc)
+                ]
 
                 if not input_files:
                     raise FileNotFoundError("No compatible input files found for clustering")
