@@ -15,6 +15,7 @@ Example:
     result = segmenter.process(mesh_path)
 """
 
+from multiprocessing import process
 import os
 import shutil
 import tempfile
@@ -336,7 +337,7 @@ class PartFieldSegmenter:
                 # If single_output=True, there is only one file anyway.
                 best_file = glb_files[-1]
                 try:
-                    output_scene = trimesh.load(best_file, force='scene')
+                    output_scene = trimesh.load(best_file, force='scene', process=False)
                 except Exception as e:
                     logger.warning("Failed to load result into Trimesh Scene: %s", e)
 
@@ -550,7 +551,7 @@ class PartFieldSegmenter:
             if not os.path.isfile(mesh_path):
                  raise FileNotFoundError(f"Cannot preprocess missing mesh: {mesh_path}")
             logger.info("Input mesh path: %s", mesh_path)
-            loaded = trimesh.load(mesh_path, force='scene')
+            loaded = trimesh.load(mesh_path, force='mesh', process=False)
         elif isinstance(mesh_input, (trimesh.Trimesh, trimesh.Scene)):
             logger.info("Input mesh object provided")
             loaded = mesh_input
@@ -579,7 +580,11 @@ class PartFieldSegmenter:
 
         total_vertices_after = len(combined_mesh.vertices)
         total_faces_after = len(combined_mesh.faces)
-        logger.info("After preprocessing: %d vertices, %d faces", total_vertices_after, total_faces_after)
+        logger.info(
+            "After preprocessing: %d vertices, %d faces", 
+            total_vertices_after, 
+            total_faces_after
+        )
         logger.info(
             "Removed %d vertices, %d faces",
             total_vertices_before - total_vertices_after,
