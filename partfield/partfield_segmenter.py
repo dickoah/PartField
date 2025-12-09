@@ -336,10 +336,10 @@ class PartFieldSegmenter:
                 # If multiple files are generated (hierarchical mode), pick the one with the highest granularity (last in sorted list)
                 # If single_output=True, there is only one file anyway.
                 best_file = glb_files[-1]
-                try:
-                    output_scene = trimesh.load(best_file, force='scene', process=False)
-                except Exception as e:
-                    logger.warning("Failed to load result into Trimesh Scene: %s", e)
+                output_scene = trimesh.load(best_file, force='scene', process=False)                    
+                # Consolidate colors if needed (only for single output mode where we expect n_parts colors)
+                if single_output and n_parts > 0:
+                    output_scene = self._consolidate_mesh_colors(output_scene, n_parts)
 
             if glb_files:
                 if single_output:
@@ -468,8 +468,6 @@ class PartFieldSegmenter:
             torch.cuda.ipc_collect()
         logger.info("Cleared CUDA cached memory")
     
-
-
     def _download_model(self) -> bool:
         """Ensure a local copy of the PartField checkpoint exists at checkpoint_path."""
         # First check if the configured checkpoint file already exists
@@ -688,3 +686,92 @@ class PartFieldSegmenter:
                 logger.info(f"[PartFieldSegmenter] Cleaned up temp dir")
             except Exception as e:
                 logger.warning(f"[PartFieldSegmenter] Failed to cleanup: {e}")
+
+    def _consolidate_mesh_colors(
+        self, 
+        mesh_or_scene: Union[trimesh.Trimesh, trimesh.Scene], 
+        n_parts: int
+    ) -> Union[trimesh.Trimesh, trimesh.Scene]:
+        """
+        Consolidate vertex colors in the scene or mesh to n_parts using K-Means.
+        Updates the meshes in-place.
+        """
+        try:
+            from sklearn.cluster import KMeans
+        except ImportError:
+            logger.warning("scikit-learn not available, skipping color consolidation")
+            return mesh_or_scene
+
+        def _normalize(c):
+            arr = np.asarray(c, dtype=np.float32)
+            if arr.size == 0: return np.zeros((0, 4), dtype=np.uint8)
+            if arr.max(initial=0) <= 1.0: arr *= 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+            if arr.ndim == 1: arr = arr.reshape(1, -1)
+            n = arr.shape[1]
+            if n == 4: return arr
+            if n == 3: return np.hstack([arr, np.full((len(arr), 1), 255, dtype=np.uint8)])
+            if n > 4: return arr[:, :4]
+            return np.hstack([arr, np.full((len(arr), 4 - n), 255, dtype=np.uint8)])
+
+        # Collect all vertex colors from all meshes
+        all_colors = []
+        mesh_color_slices = [] # (geom, start_idx, end_idx)
+        
+        current_idx = 0
+        
+        # Determine geometries to process
+        if isinstance(mesh_or_scene, trimesh.Scene):
+            geometries = list(mesh_or_scene.geometry.values())
+        elif isinstance(mesh_or_scene, trimesh.Trimesh):
+            geometries = [mesh_or_scene]
+        else:
+            logger.warning(f"Unsupported type for color consolidation: {type(mesh_or_scene)}")
+            return mesh_or_scene
+
+        for geom in geometries:
+            if isinstance(geom, trimesh.Trimesh) and hasattr(geom.visual, 'vertex_colors'):
+                vc = _normalize(geom.visual.vertex_colors)
+                if len(vc) == 0: continue
+                
+                all_colors.append(vc)
+                count = len(vc)
+                mesh_color_slices.append((geom, current_idx, current_idx + count))
+                current_idx += count
+        
+        if not all_colors:
+            return mesh_or_scene
+            
+        all_colors_stacked = np.vstack(all_colors)
+        unique_colors, inverse_indices = np.unique(all_colors_stacked, axis=0, return_inverse=True)
+        
+        # Optimization: If number of colors matches target or is less, skip consolidation
+        if len(unique_colors) <= n_parts:
+            logger.info(f"Unique colors ({len(unique_colors)}) <= target ({n_parts}). Skipping consolidation.")
+            return mesh_or_scene
+            
+        logger.info(f"Consolidating {len(unique_colors)} unique colors to {n_parts} parts")
+        
+        # K-Means on unique colors
+        # Weight by frequency
+        unique_counts = np.bincount(inverse_indices)
+        
+        kmeans = KMeans(n_clusters=n_parts, random_state=0, n_init=10)
+        kmeans.fit(unique_colors, sample_weight=unique_counts)
+        
+        # Map each unique color to a cluster center
+        cluster_centers = kmeans.cluster_centers_.astype(np.uint8)
+        unique_to_cluster = kmeans.labels_
+        
+        # Map all original vertices to cluster centers
+        new_all_colors = cluster_centers[unique_to_cluster[inverse_indices]]
+        
+        # Distribute back to meshes
+        for geom, start, end in mesh_color_slices:
+            new_vc = new_all_colors[start:end]
+            if hasattr(geom.visual, "vertex_colors"):
+                geom.visual.vertex_colors = new_vc
+            else:
+                geom.visual = trimesh.visual.ColorVisuals(geom, vertex_colors=new_vc)
+                
+        return mesh_or_scene
