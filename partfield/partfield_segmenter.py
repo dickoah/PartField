@@ -57,6 +57,7 @@ except ImportError:
 from .partfield_clusterer import PartFieldClusterer
 from .config.defaults import _C as base_cfg
 from .model_trainer_pvcnn_only_demo import Model
+from .utils import count_unique_colors, load_mesh_util, normalize_colors_to_rgba8
 
 # Setup logging
 logger = logging.getLogger("partfield_segmenter")
@@ -319,40 +320,49 @@ class PartFieldSegmenter:
                 msg = f"Clustering failed: {str(e)}"
                 logger.error(msg)
                 logger.exception(e)
-                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0, "unique_colors": 0}
 
             # Convert PLY to GLB (all in temp)
             if not os.path.isdir(ply_dir):
                 msg = f"PLY output directory not found: {ply_dir}"
                 logger.warning(msg)
-                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0, "unique_colors": 0}
 
             glb_dir = os.path.join(clustering_output_dir, "glbs")
             glb_files = self._convert_outputs_to_glb(ply_dir, glb_dir)
 
             # Load the best result into a Trimesh Scene for immediate use
             output_scene = trimesh.Scene()
+            unique_color_count = 0
             if glb_files:
                 # If multiple files are generated (hierarchical mode), pick the one with the highest granularity (last in sorted list)
                 # If single_output=True, there is only one file anyway.
                 best_file = glb_files[-1]
-                output_scene = trimesh.load(best_file, force='scene', process=False)                    
-                # Consolidate colors if needed (only for single output mode where we expect n_parts colors)
-                if single_output and n_parts > 0:
-                    output_scene = self._consolidate_mesh_colors(output_scene, n_parts)
+                try:
+                    output_scene = load_mesh_util(best_file)
+                    
+                    # Consolidate colors if needed (only for single output mode where we expect n_parts colors)
+                    if single_output and n_parts > 0:
+                        output_scene = self._consolidate_mesh_colors(output_scene, n_parts)
+
+                    # Count unique colors in the segmented result
+                    unique_color_count = count_unique_colors(output_scene)
+                except Exception as e:
+                    logger.warning("Failed to load result into Trimesh Scene: %s", e)
 
             if glb_files:
                 if single_output:
-                    msg = f"✓ Segmentation complete! Single output with {n_parts} part(s)."
+                    msg = f"✓ Segmentation complete! Single output with {n_parts} part(s). Unique colors: {unique_color_count}"
                 else:
-                    msg = f"✓ Segmentation complete! Generated {len(glb_files)} segmentation(s)."
+                    msg = f"✓ Segmentation complete! Generated {len(glb_files)} segmentation(s). Unique colors: {unique_color_count}"
                 
                 return {
                     "status": msg,
                     "glb_files": glb_files,
                     "scene": output_scene,
                     "temp_dir": self.temp_dir,
-                    "n_parts": len(glb_files)
+                    "n_parts": len(glb_files),
+                    "unique_colors": unique_color_count
                 }
             else:
                 return {
@@ -360,7 +370,8 @@ class PartFieldSegmenter:
                     "glb_files": [], 
                     "scene": trimesh.Scene(),
                     "temp_dir": self.temp_dir, 
-                    "n_parts": 0
+                    "n_parts": 0,
+                    "unique_colors": 0
                 }
 
         except Exception as e:
@@ -370,7 +381,8 @@ class PartFieldSegmenter:
                 "glb_files": [], 
                 "scene": trimesh.Scene(),
                 "temp_dir": self.temp_dir, 
-                "n_parts": 0
+                "n_parts": 0,
+                "unique_colors": 0
             }
     
     def __del__(self) -> None:
@@ -549,7 +561,7 @@ class PartFieldSegmenter:
             if not os.path.isfile(mesh_path):
                  raise FileNotFoundError(f"Cannot preprocess missing mesh: {mesh_path}")
             logger.info("Input mesh path: %s", mesh_path)
-            loaded = trimesh.load(mesh_path, force='mesh', process=False)
+            loaded = load_mesh_util(mesh_path)
         elif isinstance(mesh_input, (trimesh.Trimesh, trimesh.Scene)):
             logger.info("Input mesh object provided")
             loaded = mesh_input
@@ -652,7 +664,7 @@ class PartFieldSegmenter:
                 return glb_path
         
         # Convert PLY to GLB
-        mesh = trimesh.load(ply_path, process=False)
+        mesh = load_mesh_util(ply_path)
         mesh.export(glb_path)
         return glb_path
 
@@ -696,23 +708,20 @@ class PartFieldSegmenter:
         Consolidate vertex colors in the scene or mesh to n_parts using K-Means.
         Updates the meshes in-place.
         """
+        # Sanity checks
+        if mesh_or_scene is None:
+            logger.warning("Input mesh/scene is None, skipping color consolidation")
+            return mesh_or_scene
+            
+        if n_parts <= 0:
+            logger.warning(f"Invalid n_parts ({n_parts}), skipping color consolidation")
+            return mesh_or_scene
+
         try:
             from sklearn.cluster import KMeans
         except ImportError:
             logger.warning("scikit-learn not available, skipping color consolidation")
             return mesh_or_scene
-
-        def _normalize(c):
-            arr = np.asarray(c, dtype=np.float32)
-            if arr.size == 0: return np.zeros((0, 4), dtype=np.uint8)
-            if arr.max(initial=0) <= 1.0: arr *= 255.0
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-            if arr.ndim == 1: arr = arr.reshape(1, -1)
-            n = arr.shape[1]
-            if n == 4: return arr
-            if n == 3: return np.hstack([arr, np.full((len(arr), 1), 255, dtype=np.uint8)])
-            if n > 4: return arr[:, :4]
-            return np.hstack([arr, np.full((len(arr), 4 - n), 255, dtype=np.uint8)])
 
         # Collect all vertex colors from all meshes
         all_colors = []
@@ -731,7 +740,8 @@ class PartFieldSegmenter:
 
         for geom in geometries:
             if isinstance(geom, trimesh.Trimesh) and hasattr(geom.visual, 'vertex_colors'):
-                vc = _normalize(geom.visual.vertex_colors)
+                # Use the robust normalization from utils
+                vc = normalize_colors_to_rgba8(geom.visual.vertex_colors)
                 if len(vc) == 0: continue
                 
                 all_colors.append(vc)

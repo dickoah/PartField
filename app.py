@@ -90,6 +90,14 @@ def run_segmentation_and_prepare(
     if result['status'].startswith("Error") or not result['glb_files']:
         return result['status'], None, []
     
+    # Extract unique colors count from result
+    unique_colors = result.get('unique_colors', 0)
+    
+    # Create enhanced status message with unique colors info
+    status_msg = result['status']
+    if unique_colors > 0:
+        status_msg = f"{status_msg}\n✓ Unique vertex colors available: {unique_colors}"
+    
     # Copy files to app's temp dir to ensure persistence
     timestamp = int(time.time())
     output_dir = os.path.join(TEMP_BASE_DIR, f"run_{timestamp}")
@@ -102,7 +110,7 @@ def run_segmentation_and_prepare(
         shutil.copy2(glb_file, dst)
         saved_files.append(dst)
         
-    return result['status'], saved_files[0] if saved_files else None, saved_files
+    return status_msg, saved_files[0] if saved_files else None, saved_files
 
 
 # Build the UI
