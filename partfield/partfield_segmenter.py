@@ -57,7 +57,7 @@ except ImportError:
 from .partfield_clusterer import PartFieldClusterer
 from .config.defaults import _C as base_cfg
 from .model_trainer_pvcnn_only_demo import Model
-from .utils import count_unique_colors, load_mesh_util, normalize_colors_to_rgba8
+from .utils import count_unique_colors, load_mesh_util
 
 # Setup logging
 logger = logging.getLogger("partfield_segmenter")
@@ -141,6 +141,7 @@ class PartFieldSegmenter:
             enable_preprocessing: Enable mesh preprocessing (default: True)
             preprocess_model: Use preprocessed mesh for inference
             preprocessing_threshold: Vertex dedup threshold (default: 1e-6)
+            consolidate_pos_weight: Weight for spatial clustering (default: 0.0)
         
         Returns:
             dict with keys:
@@ -229,8 +230,7 @@ class PartFieldSegmenter:
 
             # Verify features were generated in exp_results
             # Model saves to "exp_results/{result_name}" relative to CWD
-            # But we also check script_dir just in case
-            
+            # But we also check script_dir just in case            
             possible_dirs = [
                 os.path.join(os.getcwd(), "exp_results", result_name),
                 os.path.join(self.script_dir, "exp_results", result_name)
@@ -338,17 +338,24 @@ class PartFieldSegmenter:
                 # If multiple files are generated (hierarchical mode), pick the one with the highest granularity (last in sorted list)
                 # If single_output=True, there is only one file anyway.
                 best_file = glb_files[-1]
-                try:
-                    output_scene = load_mesh_util(best_file)
-                    
-                    # Consolidate colors if needed (only for single output mode where we expect n_parts colors)
-                    if single_output and n_parts > 0:
-                        output_scene = self._consolidate_mesh_colors(output_scene, n_parts)
 
-                    # Count unique colors in the segmented result
-                    unique_color_count = count_unique_colors(output_scene)
-                except Exception as e:
-                    logger.warning("Failed to load result into Trimesh Scene: %s", e)
+                output_scene = load_mesh_util(best_file)
+                
+                # Consolidate colors if needed (only for single output mode where we expect n_parts colors)
+                current_colors = count_unique_colors(output_scene)
+                if single_output:
+                    if n_parts != current_colors:
+                        output_scene = self._consolidate_mesh_colors(output_scene, n_parts)
+                                        
+                    # Export the processed scene to a new GLB file
+                    processed_glb_path = best_file.replace(".glb", "_processed.glb")
+                    output_scene.export(processed_glb_path)
+                    
+                    # Update glb_files to point to the processed file
+                    glb_files = [processed_glb_path]                        
+
+                # Count unique colors in the segmented result
+                unique_color_count = count_unique_colors(output_scene)
 
             if glb_files:
                 if single_output:
@@ -698,90 +705,97 @@ class PartFieldSegmenter:
                 logger.info(f"[PartFieldSegmenter] Cleaned up temp dir")
             except Exception as e:
                 logger.warning(f"[PartFieldSegmenter] Failed to cleanup: {e}")
-
+    
     def _consolidate_mesh_colors(
         self, 
         mesh_or_scene: Union[trimesh.Trimesh, trimesh.Scene], 
-        n_parts: int
-    ) -> Union[trimesh.Trimesh, trimesh.Scene]:
+        n_parts: int,
+        n_smooth_iters: int = 20
+    ) -> trimesh.Scene:
         """
-        Consolidate vertex colors in the scene or mesh to n_parts using K-Means.
-        Updates the meshes in-place.
+        Consolidate vertex colors to exactly n_parts using face-based clustering.
+        Splits mesh into separate submeshes per part. Preserves original palette.
         """
-        # Sanity checks
-        if mesh_or_scene is None:
-            logger.warning("Input mesh/scene is None, skipping color consolidation")
-            return mesh_or_scene
+        from sklearn.cluster import KMeans
+        from collections import Counter
+        
+        if not isinstance(mesh_or_scene, (trimesh.Trimesh, trimesh.Scene)):
+            raise TypeError(f"Expected Trimesh/Scene, got {type(mesh_or_scene).__name__}")
+        if n_parts < 2: raise ValueError(f"n_parts must be >= 2")
+        
+        logger.info("=== Color consolidation: %d target parts ===", n_parts)
+        scene = trimesh.Scene()
+        meshes = mesh_or_scene.geometry.items() if isinstance(mesh_or_scene, trimesh.Scene) else [("mesh", mesh_or_scene)]
+        
+        for name, mesh in meshes:
+            if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) < n_parts: continue
             
-        if n_parts <= 0:
-            logger.warning(f"Invalid n_parts ({n_parts}), skipping color consolidation")
-            return mesh_or_scene
-
-        try:
-            from sklearn.cluster import KMeans
-        except ImportError:
-            logger.warning("scikit-learn not available, skipping color consolidation")
-            return mesh_or_scene
-
-        # Collect all vertex colors from all meshes
-        all_colors = []
-        mesh_color_slices = [] # (geom, start_idx, end_idx)
-        
-        current_idx = 0
-        
-        # Determine geometries to process
-        if isinstance(mesh_or_scene, trimesh.Scene):
-            geometries = list(mesh_or_scene.geometry.values())
-        elif isinstance(mesh_or_scene, trimesh.Trimesh):
-            geometries = [mesh_or_scene]
-        else:
-            logger.warning(f"Unsupported type for color consolidation: {type(mesh_or_scene)}")
-            return mesh_or_scene
-
-        for geom in geometries:
-            if isinstance(geom, trimesh.Trimesh) and hasattr(geom.visual, 'vertex_colors'):
-                # Use the robust normalization from utils
-                vc = normalize_colors_to_rgba8(geom.visual.vertex_colors)
-                if len(vc) == 0: continue
+            # 1. Cluster Face Colors
+            v_colors = mesh.visual.vertex_colors[:, :3].astype(np.float32) / 255.0
+            f_colors = v_colors[mesh.faces].mean(axis=1)
+            labels = KMeans(n_clusters=n_parts, n_init=10, random_state=42).fit_predict(f_colors)
+            
+            # 2. Build Adjacency
+            adj = mesh.face_adjacency
+            adj_list = [[] for _ in range(len(mesh.faces))]
+            for a, b in adj:
+                adj_list[a].append(b); adj_list[b].append(a)
                 
-                all_colors.append(vc)
-                count = len(vc)
-                mesh_color_slices.append((geom, current_idx, current_idx + count))
-                current_idx += count
-        
-        if not all_colors:
-            return mesh_or_scene
+            # 3. Spatial Filtering (Remove tiny/far fragments)
+            centers = mesh.triangles_center
+            diag = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+            min_frag = max(3, len(mesh.faces) // 500)
             
-        all_colors_stacked = np.vstack(all_colors)
-        unique_colors, inverse_indices = np.unique(all_colors_stacked, axis=0, return_inverse=True)
-        
-        # Optimization: If number of colors matches target or is less, skip consolidation
-        if len(unique_colors) <= n_parts:
-            logger.info(f"Unique colors ({len(unique_colors)}) <= target ({n_parts}). Skipping consolidation.")
-            return mesh_or_scene
-            
-        logger.info(f"Consolidating {len(unique_colors)} unique colors to {n_parts} parts")
-        
-        # K-Means on unique colors
-        # Weight by frequency
-        unique_counts = np.bincount(inverse_indices)
-        
-        kmeans = KMeans(n_clusters=n_parts, random_state=0, n_init=10)
-        kmeans.fit(unique_colors, sample_weight=unique_counts)
-        
-        # Map each unique color to a cluster center
-        cluster_centers = kmeans.cluster_centers_.astype(np.uint8)
-        unique_to_cluster = kmeans.labels_
-        
-        # Map all original vertices to cluster centers
-        new_all_colors = cluster_centers[unique_to_cluster[inverse_indices]]
-        
-        # Distribute back to meshes
-        for geom, start, end in mesh_color_slices:
-            new_vc = new_all_colors[start:end]
-            if hasattr(geom.visual, "vertex_colors"):
-                geom.visual.vertex_colors = new_vc
-            else:
-                geom.visual = trimesh.visual.ColorVisuals(geom, vertex_colors=new_vc)
+            for _ in range(2): # Iterative cleanup
+                for lbl in range(n_parts):
+                    mask = labels == lbl
+                    if not np.any(mask): continue
+                    
+                    # Find components (nodes=... ensures isolated faces are included)
+                    edges = adj[mask[adj].all(axis=1)]
+                    nodes = np.where(mask)[0]
+                    comps = list(trimesh.graph.connected_components(edges, nodes=nodes))
+                    if len(comps) < 2: continue
+                    
+                    comps.sort(key=len, reverse=True)
+                    main_c = centers[comps[0]].mean(axis=0)
+                    
+                    for comp in comps[1:]:
+                        dist = np.linalg.norm(centers[comp].mean(axis=0) - main_c)
+                        # Logic: Tiny OR (Far AND Small)
+                        if len(comp) < min_frag or (dist > diag * 0.25 and len(comp) < len(comps[0]) * 0.05):
+                            # Reassign to most common neighbor
+                            for f in comp:
+                                nbrs = [labels[n] for n in adj_list[f] if labels[n] != lbl]
+                                if nbrs: labels[f] = Counter(nbrs).most_common(1)[0][0]
+
+            # 4. Smooth Boundaries
+            for _ in range(n_smooth_iters):
+                changes = 0
+                new_labels = labels.copy()
+                for f, nbrs in enumerate(adj_list):
+                    if not nbrs: continue
+                    nbr_lbls = labels[nbrs]
+                    # Aggressive smoothing: Majority vote
+                    best_lbl, count = Counter(nbr_lbls).most_common(1)[0]
+                    if best_lbl != labels[f] and count > len(nbrs) / 2:
+                        new_labels[f] = best_lbl
+                        changes += 1
+                labels = new_labels
+                if not changes: break
                 
-        return mesh_or_scene
+            # 5. Split & Color
+            unique_lbls = np.unique(labels)
+            # submesh() splits mesh by face masks. append=False returns list of meshes.
+            submeshes = mesh.submesh([labels == l for l in unique_lbls], append=False)
+            
+            for sub, lbl in zip(submeshes, unique_lbls):
+                # Color: mean of original face colors for this label
+                color = f_colors[labels == lbl].mean(axis=0)
+                c_rgba = np.append(color * 255, 255).astype(np.uint8)
+                # Broadcast color to all vertices
+                sub.visual.vertex_colors = np.tile(c_rgba, (len(sub.vertices), 1))
+                scene.add_geometry(sub, node_name=f"{name}_part_{lbl}")
+                
+        logger.info("Color consolidation complete: %d total submeshes", len(scene.geometry))
+        return scene

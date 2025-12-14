@@ -128,6 +128,7 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
                 choices=[(f"Option {i}: {desc}", i) for i, desc in enumerate([
                     "Naive (simple chaining)",
                     "MST-based (better for fragmented)",
+                    "CC-MST (Connected Components MST)"
                 ])],
                 value=0,
                 label="Adjacency Matrix Option",

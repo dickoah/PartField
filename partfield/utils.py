@@ -11,7 +11,11 @@ def load_mesh_util(input_fname):
     """
     Utility function to load a mesh from file using trimesh.
     """
-    mesh = trimesh.load(input_fname, force='mesh', process=False)
+    mesh = trimesh.load(
+        input_fname, 
+        force='mesh', 
+        process=False,
+        merge_primitives=True, skip_materials=False, maintain_order=True)
     return mesh
 
 
