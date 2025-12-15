@@ -24,14 +24,14 @@ import math
 import time
 import subprocess
 from datetime import datetime
-from typing import Union, Optional, List, Dict, Any
+from typing import Union, Optional, Literal, List, Dict, Any
 from pathlib import Path
 from collections import Counter, defaultdict
 
 import trimesh
 import random
 import numpy as np
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, AgglomerativeClustering
 
 # Try to import torch and GPU utilities for memory analysis
 try:
@@ -347,7 +347,11 @@ class PartFieldSegmenter:
                 current_colors = count_unique_colors(output_scene)
                 if single_output:
                     if n_parts != current_colors:
-                        output_scene = self._consolidate_mesh_colors(output_scene, n_parts)
+                        output_scene = self._consolidate_mesh_colors(
+                            mesh_or_scene=output_scene, 
+                            n_parts=n_parts, 
+                            method="agglo"
+                        )
                                         
                     # Export the processed scene to a new GLB file
                     processed_glb_path = best_file.replace(".glb", "_processed.glb")
@@ -712,11 +716,20 @@ class PartFieldSegmenter:
         self, 
         mesh_or_scene: Union[trimesh.Trimesh, trimesh.Scene], 
         n_parts: int,
-        n_smooth_iters: int = 50
+        n_smooth_iters: int = 50,
+        method: Literal["kmeans", "agglo"] = "kmeans",
+        smoothing_thresholds: List[float] = [0.55, 0.45, 0.35],
+        cleanup_iters: int = 30,
+        cleanup_dist_ratio: float = 0.25
     ) -> trimesh.Scene:
         """
-        Consolidate vertex colors to exactly n_parts using clustering + boundary refinement.
-        Splits mesh into separate submeshes per part. Preserves original palette.
+        Consolidate vertex colors into n_parts with robust boundary refinement.
+        
+        Args:
+            method: 'kmeans' (faster) or 'agglo' (enforces connectivity).
+            smoothing_thresholds: Majority vote thresholds for progressive smoothing.
+            cleanup_iters: Iterations for small component removal.
+            cleanup_dist_ratio: Max distance ratio for satellite protection.
         """
         
         # --- Helper: Boundary Refinement ---
@@ -730,12 +743,11 @@ class PartFieldSegmenter:
             uniq_cols, lbls = np.unique(f_cols, axis=0, return_inverse=True)
             v_faces = combined.vertex_faces
             
-            # Adjacency list comp (side-effect)
             f_adj = [[] for _ in range(len(combined.faces))]
             [ (f_adj[a].append(b), f_adj[b].append(a)) for a, b in combined.face_adjacency ]
 
             # 1. Progressive Vertex Smoothing
-            for thresh in [0.55, 0.45, 0.35]:
+            for thresh in smoothing_thresholds:
                 for _ in range(n_smooth_iters):
                     updates = {}
                     for vf in v_faces:
@@ -757,11 +769,10 @@ class PartFieldSegmenter:
             diag = np.linalg.norm(combined.bounds[1] - combined.bounds[0])
             edges = combined.face_adjacency
 
-            for _ in range(30):
+            for _ in range(cleanup_iters):
                 mask = lbls[edges[:, 0]] == lbls[edges[:, 1]]
                 comps = trimesh.graph.connected_components(edges[mask], nodes=np.arange(len(lbls)))
                 
-                # Build protection mask
                 comps_by_lbl = defaultdict(list)
                 [comps_by_lbl[lbls[c[0]]].append(c) for c in comps]
                 
@@ -772,9 +783,8 @@ class PartFieldSegmenter:
                     protected[main_c] = len(main_c) >= min_sz
                     main_pos = f_ctrs[main_c].mean(0)
                     [np.put(protected, sat, True) for sat in c_list[1:] 
-                     if len(sat) >= min_sz or np.linalg.norm(f_ctrs[sat].mean(0) - main_pos) < diag * 0.25]
+                     if len(sat) >= min_sz or np.linalg.norm(f_ctrs[sat].mean(0) - main_pos) < diag * cleanup_dist_ratio]
 
-                # Flip candidates
                 candidates = [f for f in np.where(~protected)[0] if len(f_adj[f]) >= 2]
                 flips = {f: Counter(lbls[f_adj[f]]).most_common(1)[0][0] 
                          for f in candidates 
@@ -795,23 +805,33 @@ class PartFieldSegmenter:
         if not isinstance(mesh_or_scene, (trimesh.Trimesh, trimesh.Scene)):
             raise TypeError(f"Expected Trimesh/Scene, got {type(mesh_or_scene).__name__}")
         
-        logger.info("=== Color consolidation: %d parts ===", n_parts)
+        logger.info("=== Color consolidation (%s): %d parts ===", method, n_parts)
         
-        # 1. Prepare Single Mesh
         mesh = mesh_or_scene if isinstance(mesh_or_scene, trimesh.Trimesh) else mesh_or_scene.dump(concatenate=True)
         if len(mesh.faces) < max(n_parts, 10): return trimesh.Scene(mesh)
         
-        # 2. Initial Clustering
+        # 1. Cluster Face Colors
         v_colors = mesh.visual.vertex_colors[:, :3].astype(np.float32) / 255.0
         f_colors = v_colors[mesh.faces].mean(axis=1)
-        labels = KMeans(n_clusters=n_parts, n_init=10, random_state=42).fit_predict(f_colors)
         
-        # 3. Adjacency
+        if method == "agglo":
+            # Build connectivity matrix for spatial constraint
+            from scipy.sparse import coo_matrix
+            adj = mesh.face_adjacency
+            data = np.ones(len(adj), dtype=bool)
+            connectivity = coo_matrix((data, (adj[:, 0], adj[:, 1])), shape=(len(mesh.faces), len(mesh.faces)))
+            connectivity = connectivity + connectivity.T # Make symmetric
+            
+            labels = AgglomerativeClustering(n_clusters=n_parts, connectivity=connectivity).fit_predict(f_colors)
+        else:
+            labels = KMeans(n_clusters=n_parts, n_init=10, random_state=42).fit_predict(f_colors)
+        
+        # 2. Build Adjacency
         adj = mesh.face_adjacency
         adj_list = [[] for _ in range(len(mesh.faces))]
         [ (adj_list[a].append(b), adj_list[b].append(a)) for a, b in adj ]
 
-        # 4. Spatial Filtering (Satellite Removal)
+        # 3. Spatial Filtering
         centers = mesh.triangles_center
         diag = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
         min_frag = max(3, len(mesh.faces) // 500)
@@ -829,14 +849,14 @@ class PartFieldSegmenter:
                 main_c = centers[comps[0]].mean(0)
                 
                 satellites = [c for c in comps[1:] if len(c) < min_frag or 
-                              (np.linalg.norm(centers[c].mean(0) - main_c) > diag * 0.25 and len(c) < len(comps[0]) * 0.05)]
+                              (np.linalg.norm(centers[c].mean(0) - main_c) > diag * cleanup_dist_ratio and len(c) < len(comps[0]) * 0.05)]
                 
                 to_update = [f for sat in satellites for f in sat]
                 updates = {f: Counter([labels[n] for n in adj_list[f] if labels[n] != lbl]).most_common(1)[0][0]
                            for f in to_update if any(labels[n] != lbl for n in adj_list[f])}
                 labels[list(updates.keys())] = list(updates.values())
 
-        # 5. Basic Smoothing
+        # 4. Basic Smoothing
         for _ in range(20):
             updates = {f: Counter(labels[n]).most_common(1)[0][0] 
                        for f, n in enumerate(adj_list) 
@@ -844,7 +864,7 @@ class PartFieldSegmenter:
             if not updates: break
             labels[list(updates.keys())] = list(updates.values())
             
-        # 6. Split & Color
+        # 5. Split & Color
         unique_lbls = np.unique(labels)
         lbl_colors = {l: f_colors[labels == l].mean(0) for l in unique_lbls}
         scene = trimesh.Scene()
@@ -855,5 +875,4 @@ class PartFieldSegmenter:
             sub.visual.vertex_colors = np.tile(c_rgba, (len(sub.vertices), 1))
             scene.add_geometry(sub, node_name=f"part_{lbl}")
             
-        # 7. Robust Refinement
         return _refine_boundaries(scene)
