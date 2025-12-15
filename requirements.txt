@@ -19,6 +19,7 @@ h5py
 yacs
 trimesh
 scikit-image
+scikit-learn
 loguru
 boto3
 mesh2sdf

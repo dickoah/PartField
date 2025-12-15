@@ -26,10 +26,12 @@ import subprocess
 from datetime import datetime
 from typing import Union, Optional, List, Dict, Any
 from pathlib import Path
+from collections import Counter, defaultdict
 
 import trimesh
 import random
 import numpy as np
+from sklearn.cluster import KMeans
 
 # Try to import torch and GPU utilities for memory analysis
 try:
@@ -710,92 +712,148 @@ class PartFieldSegmenter:
         self, 
         mesh_or_scene: Union[trimesh.Trimesh, trimesh.Scene], 
         n_parts: int,
-        n_smooth_iters: int = 20
+        n_smooth_iters: int = 50
     ) -> trimesh.Scene:
         """
-        Consolidate vertex colors to exactly n_parts using face-based clustering.
+        Consolidate vertex colors to exactly n_parts using clustering + boundary refinement.
         Splits mesh into separate submeshes per part. Preserves original palette.
         """
-        from sklearn.cluster import KMeans
-        from collections import Counter
         
+        # --- Helper: Boundary Refinement ---
+        def _refine_boundaries(scene_in: trimesh.Scene) -> trimesh.Scene:
+            if not scene_in.geometry: return scene_in
+            combined = trimesh.util.concatenate(list(scene_in.geometry.values()))
+            if len(combined.faces) < 10: return scene_in
+
+            v_cols = combined.visual.vertex_colors[:, :3]
+            f_cols = v_cols[combined.faces[:, 0]]
+            uniq_cols, lbls = np.unique(f_cols, axis=0, return_inverse=True)
+            v_faces = combined.vertex_faces
+            
+            # Adjacency list comp (side-effect)
+            f_adj = [[] for _ in range(len(combined.faces))]
+            [ (f_adj[a].append(b), f_adj[b].append(a)) for a, b in combined.face_adjacency ]
+
+            # 1. Progressive Vertex Smoothing
+            for thresh in [0.55, 0.45, 0.35]:
+                for _ in range(n_smooth_iters):
+                    updates = {}
+                    for vf in v_faces:
+                        valid = vf[vf != -1]
+                        if len(valid) < 2: continue
+                        curr = lbls[valid]
+                        if len(set(curr)) == 1: continue
+                        
+                        best, cnt = Counter(curr).most_common(1)[0]
+                        if cnt >= len(valid) * thresh:
+                            updates.update({f: best for f in valid[curr != best]})
+                    
+                    if not updates: break
+                    lbls[list(updates.keys())] = list(updates.values())
+
+            # 2. Component Cleanup (Protected)
+            min_sz = max(5, len(combined.faces) // 200)
+            f_ctrs = combined.vertices[combined.faces].mean(1)
+            diag = np.linalg.norm(combined.bounds[1] - combined.bounds[0])
+            edges = combined.face_adjacency
+
+            for _ in range(30):
+                mask = lbls[edges[:, 0]] == lbls[edges[:, 1]]
+                comps = trimesh.graph.connected_components(edges[mask], nodes=np.arange(len(lbls)))
+                
+                # Build protection mask
+                comps_by_lbl = defaultdict(list)
+                [comps_by_lbl[lbls[c[0]]].append(c) for c in comps]
+                
+                protected = np.zeros(len(lbls), dtype=bool)
+                for c_list in comps_by_lbl.values():
+                    c_list.sort(key=len, reverse=True)
+                    main_c = c_list[0]
+                    protected[main_c] = len(main_c) >= min_sz
+                    main_pos = f_ctrs[main_c].mean(0)
+                    [np.put(protected, sat, True) for sat in c_list[1:] 
+                     if len(sat) >= min_sz or np.linalg.norm(f_ctrs[sat].mean(0) - main_pos) < diag * 0.25]
+
+                # Flip candidates
+                candidates = [f for f in np.where(~protected)[0] if len(f_adj[f]) >= 2]
+                flips = {f: Counter(lbls[f_adj[f]]).most_common(1)[0][0] 
+                         for f in candidates 
+                         if (lbls[f_adj[f]] == lbls[f]).sum() <= 1 
+                         and Counter(lbls[f_adj[f]]).most_common(1)[0][0] != lbls[f]}
+                
+                if not flips: break
+                lbls[list(flips.keys())] = list(flips.values())
+
+            res = trimesh.Scene()
+            for i, col in enumerate(uniq_cols):
+                if not (lbls == i).any(): continue
+                sub = combined.submesh([lbls == i], append=True)
+                sub.visual.vertex_colors = np.tile(np.append(col, 255).astype(np.uint8), (len(sub.vertices), 1))
+                res.add_geometry(sub, node_name=f"part_{i}")
+            return res
+
         if not isinstance(mesh_or_scene, (trimesh.Trimesh, trimesh.Scene)):
             raise TypeError(f"Expected Trimesh/Scene, got {type(mesh_or_scene).__name__}")
-        if n_parts < 2: raise ValueError(f"n_parts must be >= 2")
         
-        logger.info("=== Color consolidation: %d target parts ===", n_parts)
-        scene = trimesh.Scene()
-        meshes = mesh_or_scene.geometry.items() if isinstance(mesh_or_scene, trimesh.Scene) else [("mesh", mesh_or_scene)]
+        logger.info("=== Color consolidation: %d parts ===", n_parts)
         
-        for name, mesh in meshes:
-            if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) < n_parts: continue
-            
-            # 1. Cluster Face Colors
-            v_colors = mesh.visual.vertex_colors[:, :3].astype(np.float32) / 255.0
-            f_colors = v_colors[mesh.faces].mean(axis=1)
-            labels = KMeans(n_clusters=n_parts, n_init=10, random_state=42).fit_predict(f_colors)
-            
-            # 2. Build Adjacency
-            adj = mesh.face_adjacency
-            adj_list = [[] for _ in range(len(mesh.faces))]
-            for a, b in adj:
-                adj_list[a].append(b); adj_list[b].append(a)
-                
-            # 3. Spatial Filtering (Remove tiny/far fragments)
-            centers = mesh.triangles_center
-            diag = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
-            min_frag = max(3, len(mesh.faces) // 500)
-            
-            for _ in range(2): # Iterative cleanup
-                for lbl in range(n_parts):
-                    mask = labels == lbl
-                    if not np.any(mask): continue
-                    
-                    # Find components (nodes=... ensures isolated faces are included)
-                    edges = adj[mask[adj].all(axis=1)]
-                    nodes = np.where(mask)[0]
-                    comps = list(trimesh.graph.connected_components(edges, nodes=nodes))
-                    if len(comps) < 2: continue
-                    
-                    comps.sort(key=len, reverse=True)
-                    main_c = centers[comps[0]].mean(axis=0)
-                    
-                    for comp in comps[1:]:
-                        dist = np.linalg.norm(centers[comp].mean(axis=0) - main_c)
-                        # Logic: Tiny OR (Far AND Small)
-                        if len(comp) < min_frag or (dist > diag * 0.25 and len(comp) < len(comps[0]) * 0.05):
-                            # Reassign to most common neighbor
-                            for f in comp:
-                                nbrs = [labels[n] for n in adj_list[f] if labels[n] != lbl]
-                                if nbrs: labels[f] = Counter(nbrs).most_common(1)[0][0]
+        # 1. Prepare Single Mesh
+        mesh = mesh_or_scene if isinstance(mesh_or_scene, trimesh.Trimesh) else mesh_or_scene.dump(concatenate=True)
+        if len(mesh.faces) < max(n_parts, 10): return trimesh.Scene(mesh)
+        
+        # 2. Initial Clustering
+        v_colors = mesh.visual.vertex_colors[:, :3].astype(np.float32) / 255.0
+        f_colors = v_colors[mesh.faces].mean(axis=1)
+        labels = KMeans(n_clusters=n_parts, n_init=10, random_state=42).fit_predict(f_colors)
+        
+        # 3. Adjacency
+        adj = mesh.face_adjacency
+        adj_list = [[] for _ in range(len(mesh.faces))]
+        [ (adj_list[a].append(b), adj_list[b].append(a)) for a, b in adj ]
 
-            # 4. Smooth Boundaries
-            for _ in range(n_smooth_iters):
-                changes = 0
-                new_labels = labels.copy()
-                for f, nbrs in enumerate(adj_list):
-                    if not nbrs: continue
-                    nbr_lbls = labels[nbrs]
-                    # Aggressive smoothing: Majority vote
-                    best_lbl, count = Counter(nbr_lbls).most_common(1)[0]
-                    if best_lbl != labels[f] and count > len(nbrs) / 2:
-                        new_labels[f] = best_lbl
-                        changes += 1
-                labels = new_labels
-                if not changes: break
+        # 4. Spatial Filtering (Satellite Removal)
+        centers = mesh.triangles_center
+        diag = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+        min_frag = max(3, len(mesh.faces) // 500)
+
+        for _ in range(2):
+            for lbl in range(n_parts):
+                mask = labels == lbl
+                if not np.any(mask): continue
+                edges = adj[mask[adj].all(axis=1)]
+                nodes = np.where(mask)[0]
+                comps = list(trimesh.graph.connected_components(edges, nodes=nodes))
+                if len(comps) < 2: continue
                 
-            # 5. Split & Color
-            unique_lbls = np.unique(labels)
-            # submesh() splits mesh by face masks. append=False returns list of meshes.
-            submeshes = mesh.submesh([labels == l for l in unique_lbls], append=False)
+                comps.sort(key=len, reverse=True)
+                main_c = centers[comps[0]].mean(0)
+                
+                satellites = [c for c in comps[1:] if len(c) < min_frag or 
+                              (np.linalg.norm(centers[c].mean(0) - main_c) > diag * 0.25 and len(c) < len(comps[0]) * 0.05)]
+                
+                to_update = [f for sat in satellites for f in sat]
+                updates = {f: Counter([labels[n] for n in adj_list[f] if labels[n] != lbl]).most_common(1)[0][0]
+                           for f in to_update if any(labels[n] != lbl for n in adj_list[f])}
+                labels[list(updates.keys())] = list(updates.values())
+
+        # 5. Basic Smoothing
+        for _ in range(20):
+            updates = {f: Counter(labels[n]).most_common(1)[0][0] 
+                       for f, n in enumerate(adj_list) 
+                       if n and (lambda c: c[0][0] != labels[f] and c[0][1] > len(n)/2)(Counter(labels[n]).most_common(1))}
+            if not updates: break
+            labels[list(updates.keys())] = list(updates.values())
             
-            for sub, lbl in zip(submeshes, unique_lbls):
-                # Color: mean of original face colors for this label
-                color = f_colors[labels == lbl].mean(axis=0)
-                c_rgba = np.append(color * 255, 255).astype(np.uint8)
-                # Broadcast color to all vertices
-                sub.visual.vertex_colors = np.tile(c_rgba, (len(sub.vertices), 1))
-                scene.add_geometry(sub, node_name=f"{name}_part_{lbl}")
-                
-        logger.info("Color consolidation complete: %d total submeshes", len(scene.geometry))
-        return scene
+        # 6. Split & Color
+        unique_lbls = np.unique(labels)
+        lbl_colors = {l: f_colors[labels == l].mean(0) for l in unique_lbls}
+        scene = trimesh.Scene()
+        submeshes = mesh.submesh([labels == l for l in unique_lbls], append=False)
+        
+        for sub, lbl in zip(submeshes, unique_lbls):
+            c_rgba = np.append(lbl_colors[lbl] * 255, 255).astype(np.uint8)
+            sub.visual.vertex_colors = np.tile(c_rgba, (len(sub.vertices), 1))
+            scene.add_geometry(sub, node_name=f"part_{lbl}")
+            
+        # 7. Robust Refinement
+        return _refine_boundaries(scene)
