@@ -655,6 +655,20 @@ class PartFieldSegmenter:
         processed.update_faces(processed.unique_faces())
         processed.remove_unreferenced_vertices()
 
+        # Remove small isolated components (noise)
+        try:
+            components = trimesh.graph.connected_components(processed.face_adjacency, nodes=np.arange(len(processed.faces)))
+            if len(components) > 1:
+                thresh = max(25, max(len(c) for c in components) * 0.001)
+                keep = [c for c in components if len(c) >= thresh]
+                
+                if (n_rm := len(components) - len(keep)) > 0:
+                    logger.info("Pre-processing: Removed %d isolated noise components (< %d faces)", n_rm, int(thresh))
+                    processed.update_faces(np.concatenate(keep) if keep else [])
+                    processed.remove_unreferenced_vertices()
+        except Exception as e:
+            logger.warning("Failed to filter isolated components: %s", e)
+
         # Refresh caches so normals/UVs stay consistent
         processed._cache.clear()
         if hasattr(processed, "vertex_normals"):
@@ -822,7 +836,14 @@ class PartFieldSegmenter:
             connectivity = coo_matrix((data, (adj[:, 0], adj[:, 1])), shape=(len(mesh.faces), len(mesh.faces)))
             connectivity = connectivity + connectivity.T # Make symmetric
             
-            labels = AgglomerativeClustering(n_clusters=n_parts, connectivity=connectivity).fit_predict(f_colors)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", 
+                    message="the number of connected components of the connectivity matrix is",
+                    category=UserWarning
+                )
+                labels = AgglomerativeClustering(n_clusters=n_parts, connectivity=connectivity).fit_predict(f_colors)
         else:
             labels = KMeans(n_clusters=n_parts, n_init=10, random_state=42).fit_predict(f_colors)
         

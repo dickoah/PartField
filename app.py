@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import atexit
 import time
+from regex import T
 import trimesh
 import subprocess
 import logging
@@ -143,7 +144,7 @@ with gr.Blocks(title="PartField - simplified UI") as demo:
                                 info="Check if input is point cloud instead of mesh")
             preprocess_model = gr.Checkbox(
                 label="Preprocess Model", 
-                value=False,
+                value=True,
                 info="Use preprocessed mesh for inference (may improve results for messy meshes)"
             )
             single_output = gr.Checkbox(
