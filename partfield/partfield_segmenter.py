@@ -15,7 +15,6 @@ Example:
     result = segmenter.process(mesh_path)
 """
 
-from multiprocessing import process
 import os
 import shutil
 import tempfile
@@ -29,7 +28,6 @@ from pathlib import Path
 from collections import Counter, defaultdict
 
 import trimesh
-import random
 import numpy as np
 from sklearn.cluster import KMeans, AgglomerativeClustering
 
@@ -37,7 +35,6 @@ from sklearn.cluster import KMeans, AgglomerativeClustering
 try:
     import torch
     from lightning.pytorch import seed_everything, Trainer
-    from lightning.pytorch.strategies import DDPStrategy
     from lightning.pytorch.callbacks import ModelCheckpoint
     
     # Set optimal precision for GPUs with Tensor Cores
@@ -73,14 +70,10 @@ class PartFieldSegmenter:
     Includes inference, clustering, and mesh export.
     
     Attributes:
-        n_parts: Number of parts for clustering
-        use_agglo: Use agglomerative clustering vs K-Means
-        clustering_option: Adjacency matrix option (0=naive, 1=MST-based, 2=CC-MST)
-        with_knn: Add KNN edges for messy meshes
-        is_pc: Input is point cloud (True) vs mesh (False)
-        single_output: Generate only final N-part segmentation (faster)
-        enable_preprocessing: Enable mesh vertex deduplication
-        preprocessing_threshold: Vertex merge threshold
+        script_dir: Root directory of the PartField package.
+        checkpoint_path: Path to the model checkpoint file.
+        config_path: Path to the YAML configuration file.
+        temp_dirs: List of temporary directories created by ``process()``.
     """
     
     # ======== Main methods ========
@@ -108,14 +101,14 @@ class PartFieldSegmenter:
             self.script_dir, "configs", "final", "demo.yaml"
         )
         
-        # Temp directory
-        self.temp_dir = None
+        # Temp directories (one per process() call)
+        self.temp_dirs: List[str] = []
         
         # Download model if needed, then validate all resources exist
         self._download_model()
         self._check_resources()
         
-        logger.info(f"[PartFieldSegmenter] Initialized")
+        logger.info("[PartFieldSegmenter] Initialized")
 
     def process(
         self,
@@ -141,9 +134,7 @@ class PartFieldSegmenter:
             is_pc: Input is point cloud (default: False)
             single_output: Only output final N-part segmentation (default: True)
             enable_preprocessing: Enable mesh preprocessing (default: True)
-            preprocess_model: Use preprocessed mesh for inference
             preprocessing_threshold: Vertex dedup threshold (default: 1e-6)
-            consolidate_pos_weight: Weight for spatial clustering (default: 0.0)
         
         Returns:
             dict with keys:
@@ -151,7 +142,8 @@ class PartFieldSegmenter:
                 - 'glb_files': List of output GLB file paths
                 - 'scene': Trimesh Scene object of the result
                 - 'temp_dir': Temporary directory path (will be cleaned up on exit)
-                - 'n_parts': Number of parts generated
+                - 'n_files': Number of output files generated
+                - 'n_parts': Number of parts requested
         """
         if n_parts < 1:
             raise ValueError("Number of parts must be at least 1")
@@ -161,7 +153,8 @@ class PartFieldSegmenter:
                     n_parts, use_agglo, clustering_option, with_knn, single_output)
 
         # Create temp directory for this run
-        self.temp_dir = tempfile.mkdtemp(prefix="partfield_seg_")
+        temp_dir = tempfile.mkdtemp(prefix="partfield_seg_")
+        self.temp_dirs.append(temp_dir)
         
         try:
             # Set up unique result directory in temp folder
@@ -175,7 +168,7 @@ class PartFieldSegmenter:
                 
             result_name = f"results_{timestamp}_{model_basename}"
             
-            temp_result_dir = os.path.join(self.temp_dir, result_name)
+            temp_result_dir = os.path.join(temp_dir, result_name)
             model_dir = os.path.join(temp_result_dir, "data")
             os.makedirs(model_dir, exist_ok=True)
 
@@ -191,7 +184,7 @@ class PartFieldSegmenter:
                 shutil.copy2(mesh_path, target_mesh_path)
                 logger.info("Copied input mesh to %s", target_mesh_path)
             elif isinstance(mesh, (trimesh.Trimesh, trimesh.Scene)):
-                target_mesh_path = os.path.join(model_dir, "input_mesh.glb" )
+                target_mesh_path = os.path.join(model_dir, "input_mesh.glb")
                 mesh.export(target_mesh_path)
                 logger.info("Exported input mesh object to %s", target_mesh_path)
             else:
@@ -208,6 +201,8 @@ class PartFieldSegmenter:
                     model_dir = preprocess_dir
                 except Exception as e:
                     logger.warning("Mesh preprocessing failed: %s. Continuing with original mesh.", e)
+            else:
+                logger.info("Preprocessing disabled. Using original mesh for inference.")
 
             # Run inference directly            
             # Create temp features dir
@@ -228,11 +223,11 @@ class PartFieldSegmenter:
                 msg = f"Inference failed: {str(e)}"
                 logger.error(msg)
                 logger.exception(e)
-                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": temp_dir, "n_files": 0, "n_parts": 0, "unique_colors": 0}
 
             # Verify features were generated in exp_results
             # Model saves to "exp_results/{result_name}" relative to CWD
-            # But we also check script_dir just in case            
+            # But we also check script_dir just in case
             possible_dirs = [
                 os.path.join(os.getcwd(), "exp_results", result_name),
                 os.path.join(self.script_dir, "exp_results", result_name)
@@ -247,7 +242,7 @@ class PartFieldSegmenter:
             if not actual_features_dir:
                 msg = f"Inference output not found in: {possible_dirs}"
                 logger.error(msg)
-                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": temp_dir, "n_files": 0, "n_parts": 0, "unique_colors": 0}
             
             # Copy features to temp dir
             for fname in os.listdir(actual_features_dir):
@@ -322,13 +317,13 @@ class PartFieldSegmenter:
                 msg = f"Clustering failed: {str(e)}"
                 logger.error(msg)
                 logger.exception(e)
-                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0, "unique_colors": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": temp_dir, "n_files": 0, "n_parts": 0, "unique_colors": 0}
 
             # Convert PLY to GLB (all in temp)
             if not os.path.isdir(ply_dir):
                 msg = f"PLY output directory not found: {ply_dir}"
                 logger.warning(msg)
-                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": self.temp_dir, "n_parts": 0, "unique_colors": 0}
+                return {"status": msg, "glb_files": [], "scene": trimesh.Scene(), "temp_dir": temp_dir, "n_files": 0, "n_parts": 0, "unique_colors": 0}
 
             glb_dir = os.path.join(clustering_output_dir, "glbs")
             glb_files = self._convert_outputs_to_glb(ply_dir, glb_dir)
@@ -373,8 +368,9 @@ class PartFieldSegmenter:
                     "status": msg,
                     "glb_files": glb_files,
                     "scene": output_scene,
-                    "temp_dir": self.temp_dir,
-                    "n_parts": len(glb_files),
+                    "temp_dir": temp_dir,
+                    "n_files": len(glb_files),
+                    "n_parts": n_parts,
                     "unique_colors": unique_color_count
                 }
             else:
@@ -382,7 +378,8 @@ class PartFieldSegmenter:
                     "status": "No parts generated", 
                     "glb_files": [], 
                     "scene": trimesh.Scene(),
-                    "temp_dir": self.temp_dir, 
+                    "temp_dir": temp_dir, 
+                    "n_files": 0,
                     "n_parts": 0,
                     "unique_colors": 0
                 }
@@ -393,7 +390,8 @@ class PartFieldSegmenter:
                 "status": f"Error: {e}", 
                 "glb_files": [], 
                 "scene": trimesh.Scene(),
-                "temp_dir": self.temp_dir, 
+                "temp_dir": temp_dir, 
+                "n_files": 0,
                 "n_parts": 0,
                 "unique_colors": 0
             }
@@ -431,6 +429,10 @@ class PartFieldSegmenter:
         dt = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         cfg.output_dir = os.path.join(cfg.output_dir, dt + "_" + cfg.name)
         
+        # Override remesh_demo settings before freezing
+        if cfg.remesh_demo:
+            cfg.n_point_per_face = 10
+        
         # Freeze the config to prevent accidental modification
         cfg.freeze()
         return cfg
@@ -443,10 +445,6 @@ class PartFieldSegmenter:
             raise ImportError("PyTorch and Lightning are required for inference.")
 
         seed_everything(cfg.seed)
-
-        torch.manual_seed(0)
-        random.seed(0)
-        np.random.seed(0)
         
         checkpoint_callbacks = [ModelCheckpoint(
             monitor="train/current_epoch",
@@ -459,10 +457,10 @@ class PartFieldSegmenter:
             verbose=True
         )]
 
-        trainer = Trainer(devices=1, # Use 1 GPU to avoid DDP complications in interactive mode
+        trainer = Trainer(devices=1,
                           accelerator="gpu",
                           precision="16-mixed",
-                          strategy=DDPStrategy(find_unused_parameters=True),
+                          strategy="auto",
                           max_epochs=cfg.training_epochs,
                           log_every_n_steps=1,
                           limit_train_batches=3500,
@@ -471,11 +469,7 @@ class PartFieldSegmenter:
                           logger=False  # Disable default logger to avoid tensorboardX requirement
                          )
 
-        model = Model(cfg)        
-
-        if cfg.remesh_demo:
-            cfg.n_point_per_face = 10
-
+        model = Model(cfg)
         trainer.predict(model, ckpt_path=cfg.continue_ckpt)
     
     def _clear_gpu_memory(self) -> None:
@@ -533,7 +527,7 @@ class PartFieldSegmenter:
                 if line:
                     logger.info("git clone progress: %s", line.rstrip())
             
-            proc.wait()
+            proc.wait(timeout=600)
             returncode = proc.returncode
             
             logger.info("git clone completed with returncode=%s", returncode)
@@ -627,7 +621,11 @@ class PartFieldSegmenter:
 
         return output_path
 
-    def _clean_mesh_geometry(self, original: trimesh.Trimesh, threshold: float) -> trimesh.Trimesh:
+    def _clean_mesh_geometry(
+        self, 
+        original: trimesh.Trimesh, 
+        threshold: float
+    ) -> trimesh.Trimesh:
         """Clean a single trimesh geometry."""
         if original.vertices.size == 0:
             raise ValueError("Mesh has no vertices")
@@ -642,25 +640,66 @@ class PartFieldSegmenter:
         processed = original.copy()
 
         logger.debug("Cleaning mesh '%s': %d vertices, %d faces before", getattr(original, 'metadata', {}).get('name', 'mesh'), len(processed.vertices), len(processed.faces))
+        
+        # Detect mesh properties to decide merge behaviour.
+        def _inspect_visual(mesh):
+            vis = getattr(mesh, "visual", None)
+            if not isinstance(vis, trimesh.visual.TextureVisuals):
+                return False, False, False
+            uv = getattr(vis, "uv", None)
+            has_uv = uv is not None and len(uv) > 0
+            mat = getattr(vis, "material", None)
+            has_mat = mat is not None and any(
+                getattr(mat, a, None) is not None
+                for a in ("image", "baseColorTexture", "baseColorFactor")
+            )
+            has_nmap = mat is not None and any(
+                getattr(mat, a, None) is not None
+                for a in ("normalTexture", "normals")
+            )
+            return has_uv, has_mat, has_nmap
 
+        has_uv, has_material, has_normal_map = _inspect_visual(processed)
+
+        merge_tex = not (has_uv and has_material)
+        merge_norm = not has_normal_map
+
+        logger.debug("has_uv=%s, has_material=%s, has_normal_map=%s", has_uv, has_material, has_normal_map)
+        logger.debug("merge_tex=%s, merge_norm=%s", merge_tex, merge_norm)
+        
+        verts_before = len(processed.vertices)
         processed.merge_vertices(
-            merge_tex=True,
-            merge_norm=True,
+            merge_tex=merge_tex,
+            merge_norm=merge_norm,
             digits_vertex=digits_vertex,
             digits_norm=max(1, digits_vertex - 1),
             digits_uv=max(1, digits_vertex - 1),
         )
+        verts_after_merge = len(processed.vertices)
+        logger.debug("Merge-vertices removed %d vertices", verts_before - verts_after_merge)
 
         processed.update_faces(processed.nondegenerate_faces())
         processed.update_faces(processed.unique_faces())
         processed.remove_unreferenced_vertices()
+        verts_after_cleanup = len(processed.vertices)
+        logger.debug("Cleanup removed %d vertices", verts_after_merge - verts_after_cleanup)
 
         # Refresh caches so normals/UVs stay consistent
         processed._cache.clear()
-        if hasattr(processed, "vertex_normals"):
+
+        # Compute vertex normals if the mesh doesn't already have them
+        try:
+            normals = processed.vertex_normals
+            if normals is None or len(normals) == 0:
+                raise ValueError("empty normals")
+            logger.debug("  Vertex normals present (%d)", len(normals))
+        except Exception:
+            logger.debug("  No vertex normals found — computing from faces")
+            processed.fix_normals()
             _ = processed.vertex_normals
 
-        logger.debug("Cleaned mesh now has %d vertices, %d faces", len(processed.vertices), len(processed.faces))
+        verts_final = len(processed.vertices)
+        logger.debug("Cleaned mesh now has %d vertices, %d faces (total removed: %d)", verts_final, len(processed.faces), verts_before - verts_final)
         return processed
 
     def _convert_ply_to_glb(self, ply_path: str, glb_dir: str) -> str:
@@ -704,13 +743,15 @@ class PartFieldSegmenter:
         return glb_files
 
     def _cleanup(self) -> None:
-        """Clean up temporary files."""
-        if self.temp_dir and os.path.exists(self.temp_dir):
-            try:
-                shutil.rmtree(self.temp_dir)
-                logger.info(f"[PartFieldSegmenter] Cleaned up temp dir")
-            except Exception as e:
-                logger.warning(f"[PartFieldSegmenter] Failed to cleanup: {e}")
+        """Clean up all temporary directories created by process() calls."""
+        for temp_dir in list(self.temp_dirs):
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    logger.info("[PartFieldSegmenter] Cleaned up temp dir: %s", temp_dir)
+                except Exception as e:
+                    logger.warning("[PartFieldSegmenter] Failed to cleanup %s: %s", temp_dir, e)
+        self.temp_dirs.clear()
     
     def _consolidate_mesh_colors(
         self, 
@@ -718,9 +759,10 @@ class PartFieldSegmenter:
         n_parts: int,
         n_smooth_iters: int = 50,
         method: Literal["kmeans", "agglo"] = "kmeans",
-        smoothing_thresholds: List[float] = [0.55, 0.45, 0.35],
+        smoothing_thresholds: Optional[List[float]] = None,
         cleanup_iters: int = 30,
-        cleanup_dist_ratio: float = 0.25
+        cleanup_dist_ratio: float = 0.25,
+        aggressive_absorption: bool = False
     ) -> trimesh.Scene:
         """
         Consolidate vertex colors into n_parts with robust boundary refinement.
@@ -730,149 +772,187 @@ class PartFieldSegmenter:
             smoothing_thresholds: Majority vote thresholds for progressive smoothing.
             cleanup_iters: Iterations for small component removal.
             cleanup_dist_ratio: Max distance ratio for satellite protection.
+            aggressive_absorption: When True, use aggressive fragment absorption
+                that merges more small components (may over-merge small parts
+                like eyes, buttons, etc.). When False (default), use milder
+                settings that better preserve small but meaningful parts.
         """
+        if smoothing_thresholds is None:
+            smoothing_thresholds = [0.50, 0.45, 0.40, 0.35]
         
-        # --- Helper: Boundary Refinement ---
+        # ── Shared micro-helpers ──────────────────────────────────────────
+        def _build_wadj(nf, adjacency, angles):
+            """Adjacency lists + cos(dihedral/2) edge weights."""
+            ew = np.cos(np.minimum(angles, np.pi) * 0.5)
+            al, aw = [[] for _ in range(nf)], [dict() for _ in range(nf)]
+            for (a, b), w in zip(adjacency, ew):
+                al[a].append(b)
+                aw[a][b] = w
+                al[b].append(a)
+                aw[b][a] = w
+            return al, aw
+
+        def _wbest(f, al, aw, lbls):
+            """Weighted vote for one face → (best_label, best_w, total_w)."""
+            v = defaultdict(float)
+            for n in al[f]:
+                v[lbls[n]] += aw[f].get(n, 1.0)
+            bl = max(v, key=v.get)
+            return bl, v[bl], sum(v.values())
+
+        def _smooth(lbls, al, aw, thresholds, iters=30):
+            """Multi-phase dihedral-weighted majority-vote smoothing (in-place)."""
+            for t in thresholds:
+                for _ in range(iters):
+                    u = {f: r[0] for f in range(len(al)) if al[f]
+                        and (r := _wbest(f, al, aw, lbls))[0] != lbls[f]
+                        and r[1] > r[2] * t}
+                    if not u: break
+                    lbls[list(u.keys())] = list(u.values())
+
+        def _absorb(lbls, adj_pairs, al, min_sz, passes=6):
+            """Absorb connected components < min_sz into neighbours (in-place)."""
+            for _ in range(passes):
+                dirty = False
+                for lbl in np.unique(lbls):
+                    m = lbls == lbl
+                    comps = sorted(trimesh.graph.connected_components(
+                        adj_pairs[m[adj_pairs].all(1)], nodes=np.where(m)[0]),
+                        key=len, reverse=True)
+                    for c in comps[1:]:
+                        if len(c) >= min_sz: continue
+                        for f in c:
+                            if (nb := [lbls[n] for n in al[f] if lbls[n] != lbl]):
+                                lbls[f] = Counter(nb).most_common(1)[0][0]
+                                dirty = True
+                if not dirty: break
+
+        # ── Boundary Refinement ──────────────────────────────────────────
         def _refine_boundaries(scene_in: trimesh.Scene) -> trimesh.Scene:
             if not scene_in.geometry: return scene_in
-            combined = trimesh.util.concatenate(list(scene_in.geometry.values()))
-            if len(combined.faces) < 10: return scene_in
+            m = trimesh.util.concatenate(list(scene_in.geometry.values()))
+            if len(m.faces) < 10: return scene_in
 
-            v_cols = combined.visual.vertex_colors[:, :3]
-            f_cols = v_cols[combined.faces[:, 0]]
-            uniq_cols, lbls = np.unique(f_cols, axis=0, return_inverse=True)
-            v_faces = combined.vertex_faces
-            
-            f_adj = [[] for _ in range(len(combined.faces))]
-            [ (f_adj[a].append(b), f_adj[b].append(a)) for a, b in combined.face_adjacency ]
+            uniq_cols, lbls = np.unique(
+                m.visual.vertex_colors[:, :3][m.faces[:, 0]], axis=0, return_inverse=True)
+            al, aw = _build_wadj(len(m.faces), m.face_adjacency, m.face_adjacency_angles)
+            edges = m.face_adjacency
 
-            # 1. Progressive Vertex Smoothing
+            # Vertex-ring progressive smoothing
             for thresh in smoothing_thresholds:
                 for _ in range(n_smooth_iters):
-                    updates = {}
-                    for vf in v_faces:
-                        valid = vf[vf != -1]
-                        if len(valid) < 2: continue
-                        curr = lbls[valid]
-                        if len(set(curr)) == 1: continue
-                        
-                        best, cnt = Counter(curr).most_common(1)[0]
-                        if cnt >= len(valid) * thresh:
-                            updates.update({f: best for f in valid[curr != best]})
-                    
-                    if not updates: break
-                    lbls[list(updates.keys())] = list(updates.values())
+                    u = {f: best
+                        for vf in m.vertex_faces
+                        for valid in [vf[vf != -1]] if len(valid) >= 2
+                        for curr in [lbls[valid]] if len(set(curr)) > 1
+                        for best, cnt in [Counter(curr).most_common(1)[0]]
+                        if cnt >= len(valid) * thresh
+                        for f in valid[curr != best]}
+                    if not u: break
+                    lbls[list(u.keys())] = list(u.values())
 
-            # 2. Component Cleanup (Protected)
-            min_sz = max(5, len(combined.faces) // 200)
-            f_ctrs = combined.vertices[combined.faces].mean(1)
-            diag = np.linalg.norm(combined.bounds[1] - combined.bounds[0])
-            edges = combined.face_adjacency
+            # Face-adjacency weighted smoothing
+            _smooth(lbls, al, aw, smoothing_thresholds[1:])
 
+            # Component cleanup (weighted)
+            min_sz = max(5, len(m.faces) // 80) if aggressive_absorption else max(5, len(m.faces) // 200)
+            ctrs = m.vertices[m.faces].mean(1)
+            bd = np.linalg.norm(m.bounds[1] - m.bounds[0])
             for _ in range(cleanup_iters):
-                mask = lbls[edges[:, 0]] == lbls[edges[:, 1]]
-                comps = trimesh.graph.connected_components(edges[mask], nodes=np.arange(len(lbls)))
-                
-                comps_by_lbl = defaultdict(list)
-                [comps_by_lbl[lbls[c[0]]].append(c) for c in comps]
-                
+                comps_by = defaultdict(list)
+                [comps_by[lbls[c[0]]].append(c) for c in
+                 trimesh.graph.connected_components(
+                     edges[lbls[edges[:, 0]] == lbls[edges[:, 1]]],
+                     nodes=np.arange(len(lbls)))]
                 protected = np.zeros(len(lbls), dtype=bool)
-                for c_list in comps_by_lbl.values():
-                    c_list.sort(key=len, reverse=True)
-                    main_c = c_list[0]
-                    protected[main_c] = len(main_c) >= min_sz
-                    main_pos = f_ctrs[main_c].mean(0)
-                    [np.put(protected, sat, True) for sat in c_list[1:] 
-                     if len(sat) >= min_sz or np.linalg.norm(f_ctrs[sat].mean(0) - main_pos) < diag * cleanup_dist_ratio]
-
-                candidates = [f for f in np.where(~protected)[0] if len(f_adj[f]) >= 2]
-                flips = {f: Counter(lbls[f_adj[f]]).most_common(1)[0][0] 
-                         for f in candidates 
-                         if (lbls[f_adj[f]] == lbls[f]).sum() <= 1 
-                         and Counter(lbls[f_adj[f]]).most_common(1)[0][0] != lbls[f]}
-                
+                for cl in comps_by.values():
+                    cl.sort(key=len, reverse=True)
+                    protected[cl[0]] = len(cl[0]) >= min_sz
+                    mp = ctrs[cl[0]].mean(0)
+                    [np.put(protected, s, True) for s in cl[1:]
+                     if len(s) >= min_sz or np.linalg.norm(ctrs[s].mean(0) - mp) < bd * cleanup_dist_ratio]
+                flips = {f: r[0] for f in np.where(~protected)[0] if al[f]
+                         and (r := _wbest(f, al, aw, lbls))[0] != lbls[f]}
                 if not flips: break
                 lbls[list(flips.keys())] = list(flips.values())
 
             res = trimesh.Scene()
             for i, col in enumerate(uniq_cols):
                 if not (lbls == i).any(): continue
-                sub = combined.submesh([lbls == i], append=True)
-                sub.visual.vertex_colors = np.tile(np.append(col, 255).astype(np.uint8), (len(sub.vertices), 1))
+                sub = m.submesh([lbls == i], append=True)
+                sub.visual.vertex_colors = np.tile(
+                    np.append(col, 255).astype(np.uint8), (len(sub.vertices), 1))
                 res.add_geometry(sub, node_name=f"part_{i}")
             return res
 
+        # ── Main pipeline ────────────────────────────────────────────────
         if not isinstance(mesh_or_scene, (trimesh.Trimesh, trimesh.Scene)):
             raise TypeError(f"Expected Trimesh/Scene, got {type(mesh_or_scene).__name__}")
-        
+
         logger.info("=== Color consolidation (%s): %d parts ===", method, n_parts)
-        
+
         mesh = mesh_or_scene if isinstance(mesh_or_scene, trimesh.Trimesh) else mesh_or_scene.dump(concatenate=True)
         if len(mesh.faces) < max(n_parts, 10): return trimesh.Scene(mesh)
-        
-        # 1. Cluster Face Colors
-        v_colors = mesh.visual.vertex_colors[:, :3].astype(np.float32) / 255.0
-        f_colors = v_colors[mesh.faces].mean(axis=1)
-        
+
+        # 1. Cluster face colours
+        f_colors = (mesh.visual.vertex_colors[:, :3].astype(np.float32) / 255.0)[mesh.faces].mean(1)
+        adj = mesh.face_adjacency
+
         if method == "agglo":
-            # Build connectivity matrix for spatial constraint
             from scipy.sparse import coo_matrix
-            adj = mesh.face_adjacency
-            data = np.ones(len(adj), dtype=bool)
-            connectivity = coo_matrix((data, (adj[:, 0], adj[:, 1])), shape=(len(mesh.faces), len(mesh.faces)))
-            connectivity = connectivity + connectivity.T # Make symmetric
-            
-            labels = AgglomerativeClustering(n_clusters=n_parts, connectivity=connectivity).fit_predict(f_colors)
+            conn = coo_matrix((np.ones(len(adj), dtype=bool), (adj[:, 0], adj[:, 1])),
+                              shape=(len(mesh.faces),) * 2)
+            labels = AgglomerativeClustering(
+                n_clusters=n_parts, connectivity=conn + conn.T).fit_predict(f_colors)
         else:
             labels = KMeans(n_clusters=n_parts, n_init=10, random_state=42).fit_predict(f_colors)
-        
-        # 2. Build Adjacency
-        adj = mesh.face_adjacency
-        adj_list = [[] for _ in range(len(mesh.faces))]
-        [ (adj_list[a].append(b), adj_list[b].append(a)) for a, b in adj ]
 
-        # 3. Spatial Filtering
-        centers = mesh.triangles_center
-        diag = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
-        min_frag = max(3, len(mesh.faces) // 500)
+        # 2. Dihedral-weighted adjacency
+        adj_list, adj_weight = _build_wadj(len(mesh.faces), adj, mesh.face_adjacency_angles)
 
-        for _ in range(2):
+        # 3. Spatial filtering — absorb small disconnected fragments
+        centers, diag = mesh.triangles_center, np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+        if aggressive_absorption:
+            min_frag = max(5, len(mesh.faces) // 100)
+            sat_ratio, spatial_passes = 0.10, 4
+        else:
+            min_frag = max(3, len(mesh.faces) // 500)
+            sat_ratio, spatial_passes = 0.05, 2
+        for _ in range(spatial_passes):
+            changed = False
             for lbl in range(n_parts):
                 mask = labels == lbl
-                if not np.any(mask): continue
-                edges = adj[mask[adj].all(axis=1)]
-                nodes = np.where(mask)[0]
-                comps = list(trimesh.graph.connected_components(edges, nodes=nodes))
+                if not mask.any(): continue
+                comps = sorted(trimesh.graph.connected_components(
+                    adj[mask[adj].all(1)], nodes=np.where(mask)[0]), key=len, reverse=True)
                 if len(comps) < 2: continue
-                
-                comps.sort(key=len, reverse=True)
-                main_c = centers[comps[0]].mean(0)
-                
-                satellites = [c for c in comps[1:] if len(c) < min_frag or 
-                              (np.linalg.norm(centers[c].mean(0) - main_c) > diag * cleanup_dist_ratio and len(c) < len(comps[0]) * 0.05)]
-                
-                to_update = [f for sat in satellites for f in sat]
+                mc = centers[comps[0]].mean(0)
+                sats = [f for c in comps[1:]
+                        if len(c) < min_frag or
+                        (np.linalg.norm(centers[c].mean(0) - mc) > diag * cleanup_dist_ratio
+                         and len(c) < len(comps[0]) * sat_ratio)
+                        for f in c]
                 updates = {f: Counter([labels[n] for n in adj_list[f] if labels[n] != lbl]).most_common(1)[0][0]
-                           for f in to_update if any(labels[n] != lbl for n in adj_list[f])}
-                labels[list(updates.keys())] = list(updates.values())
+                           for f in sats if any(labels[n] != lbl for n in adj_list[f])}
+                if updates:
+                    labels[list(updates.keys())] = list(updates.values())
+                    changed = True
+            if not changed: break
 
-        # 4. Basic Smoothing
-        for _ in range(20):
-            updates = {f: Counter(labels[n]).most_common(1)[0][0] 
-                       for f, n in enumerate(adj_list) 
-                       if n and (lambda c: c[0][0] != labels[f] and c[0][1] > len(n)/2)(Counter(labels[n]).most_common(1))}
-            if not updates: break
-            labels[list(updates.keys())] = list(updates.values())
-            
-        # 5. Split & Color
+        # 4. Multi-phase geometry-aware smoothing
+        _smooth(labels, adj_list, adj_weight, smoothing_thresholds)
+
+        # 4b. Morphological cleanup
+        absorb_min = max(5, len(mesh.faces) // 80) if aggressive_absorption else max(3, len(mesh.faces) // 200)
+        _absorb(labels, adj, adj_list, absorb_min)
+
+        # 5. Split & colour
         unique_lbls = np.unique(labels)
         lbl_colors = {l: f_colors[labels == l].mean(0) for l in unique_lbls}
         scene = trimesh.Scene()
-        submeshes = mesh.submesh([labels == l for l in unique_lbls], append=False)
-        
-        for sub, lbl in zip(submeshes, unique_lbls):
-            c_rgba = np.append(lbl_colors[lbl] * 255, 255).astype(np.uint8)
-            sub.visual.vertex_colors = np.tile(c_rgba, (len(sub.vertices), 1))
+        for sub, lbl in zip(mesh.submesh([labels == l for l in unique_lbls], append=False), unique_lbls):
+            c = np.append(lbl_colors[lbl] * 255, 255).astype(np.uint8)
+            sub.visual.vertex_colors = np.tile(c, (len(sub.vertices), 1))
             scene.add_geometry(sub, node_name=f"part_{lbl}")
-            
+
         return _refine_boundaries(scene)

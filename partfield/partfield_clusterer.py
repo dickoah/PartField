@@ -665,7 +665,7 @@ class PartFieldClusterer:
             for i, label in enumerate(unique_labels)
         }
         
-        mesh = trimesh.Trimesh(vertices=V, faces=F)
+        mesh = trimesh.Trimesh(vertices=V, faces=F, process=False)
         FL = np.squeeze(FL)
         for i, face in enumerate(F):
             label = FL[i]
