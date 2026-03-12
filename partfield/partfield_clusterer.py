@@ -58,7 +58,7 @@ class PartFieldClusterer:
     
     def __init__(self):
         """Initialize the Part Clusterer."""
-        logger.info("[PartClusterer] Initialized")
+        logger.debug("[PartClusterer] Initialized")
     
     def process(
         self,
@@ -107,7 +107,7 @@ class PartFieldClusterer:
                 raise FileNotFoundError(f"Features file not found: {features}")
             point_feat = np.load(features)
             if verbose:
-                logger.info(f"Loaded features from {features}: shape {point_feat.shape}")
+                logger.debug(f"Loaded features from {features}: shape {point_feat.shape}")
         else:
             point_feat = np.asarray(features)
         
@@ -120,12 +120,12 @@ class PartFieldClusterer:
             if isinstance(mesh, str) or isinstance(mesh, Path):
                 mesh_obj = load_mesh_util(str(mesh))
                 if verbose:
-                    logger.info(f"Loaded mesh: {mesh_obj.vertices.shape[0]} vertices, {mesh_obj.faces.shape[0]} faces")
+                    logger.debug(f"Loaded mesh: {mesh_obj.vertices.shape[0]} vertices, {mesh_obj.faces.shape[0]} faces")
             elif isinstance(mesh, trimesh.Scene):
                 # Convert Scene to Trimesh by merging all geometries
                 mesh_obj = mesh.dump(concatenate=True)
                 if verbose:
-                    logger.info(f"Loaded scene: {mesh_obj.vertices.shape[0]} vertices, {mesh_obj.faces.shape[0]} faces")
+                    logger.debug(f"Loaded scene: {mesh_obj.vertices.shape[0]} vertices, {mesh_obj.faces.shape[0]} faces")
             else:
                 mesh_obj = mesh
         
@@ -180,7 +180,7 @@ class PartFieldClusterer:
                 )
             
             if verbose:
-                logger.info(f"Constructing adjacency matrix (option={clustering_option})")
+                logger.debug(f"Constructing adjacency matrix (option={clustering_option})")
             
             # Build adjacency matrix
             adj_matrix = self._construct_adjacency_matrix(
@@ -194,7 +194,7 @@ class PartFieldClusterer:
             if single_output:
                 # Direct clustering to exactly n_parts
                 if verbose:
-                    logger.info(f"Running agglomerative clustering to {n_parts} clusters")
+                    logger.debug(f"Running agglomerative clustering to {n_parts} clusters")
                 
                 clustering = AgglomerativeClustering(
                     connectivity=adj_matrix,
@@ -268,17 +268,17 @@ class PartFieldClusterer:
         """
         if option == 0:
             if verbose:
-                logger.info("Using naive adjacency matrix")
+                logger.debug("Using naive adjacency matrix")
             return self._construct_face_adjacency_matrix_naive(faces)
         elif option == 1:
             if verbose:
-                logger.info("Using face-MST adjacency matrix")
+                logger.debug("Using face-MST adjacency matrix")
             return self._construct_face_adjacency_matrix_facemst(
                 faces, vertices, with_knn=with_knn
             )
         else:
             if verbose:
-                logger.info("Using component-MST adjacency matrix")
+                logger.debug("Using component-MST adjacency matrix")
             return self._construct_face_adjacency_matrix_ccmst(
                 faces, vertices, with_knn=with_knn
             )
@@ -636,7 +636,7 @@ class PartFieldClusterer:
             output_files.append(out_file)
             
             if verbose:
-                logger.info(f"Exported mesh to {out_file}")
+                logger.debug(f"Exported mesh to {out_file}")
         
         else:
             out_file = os.path.join(output_dir, f"cluster_{num_clusters:02d}.ply")
